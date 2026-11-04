@@ -282,6 +282,9 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   sessions' discovery selections intact and authorize external calls only in their owned wrapper.
 - Diagnose the selected discovery/shell services and scoped publication; clarify the host's
   ancestor-registration/restriction limit for nested unrelated preset integrations.
+- Read PDFs whose stream `/Length`, trailer `/Size` or page-tree `/Count` is an indirect
+  reference: resolve the chain through the xref table with bounded hops and cycle detection
+  instead of failing with "Expected a bounded nonnegative PDF integer".
 - 切换离开已接入预设时撤回 PTC 发布并取消调用；保留其他会话的发现选择，外部调用仅在自有包装内授权一次。
 - 诊断所选发现/Shell 的服务与作用域发布，并说明无关预设嵌套时宿主继承祖先注册/限制的边界。
 - Plan only the new Agent on `agent/created` instead of re-reading every live session's tool
@@ -290,7 +293,8 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   was the visible lag when starting one with many sessions open.
 - 新建会话时只规划新 Agent，不再重读所有存活会话的工具视图；`tools/change` 只核对它实际触达的
   Agent，宿主未标注归属的变更合并为一次处理。新建会话不再随已开会话数线性扫描工具视图。
-
+- 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
+  带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败。
 
 ## [0.5.0] — 2026-10-27 — Preset-mode component roster
 

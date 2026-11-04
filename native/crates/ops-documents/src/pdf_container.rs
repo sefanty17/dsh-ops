@@ -1,4 +1,4 @@
-//! A deliberately restricted PDF container: one classic xref table, direct stream lengths, no recovery.
+//! A deliberately restricted PDF container: one classic xref table, no recovery.
 use crate::pdf_syntax::{Dict, Lexer, Value, bad, limit, unsupported, white};
 use ops_protocol::Result;
 use std::collections::{BTreeMap, BTreeSet};
@@ -6,6 +6,8 @@ pub const MAX_FILE: usize = 16 * 1024 * 1024;
 pub const MAX_OBJECTS: usize = 10_000;
 pub const MAX_STREAM: usize = 1024 * 1024;
 pub type ObjectId = (u32, u16);
+/// Parsed classic xref table: object number -> (header byte offset, generation, in use).
+type Xref = BTreeMap<usize, (usize, u16, bool)>;
 #[derive(Debug)]
 pub struct Object<'a> {
     pub value: Value,
@@ -82,11 +84,82 @@ fn footer(data: &[u8]) -> Result<(usize, usize)> {
     }
     Ok((xref, footer_start))
 }
+/// Read one xref-indexed object value from `data`, which is bounded to the object section.
+fn referenced_value(
+    data: &[u8],
+    entries: &Xref,
+    id: ObjectId,
+    nodes: usize,
+) -> Result<(Value, usize)> {
+    let Some((offset, generation, true)) = entries.get(&(id.0 as usize)).copied() else {
+        return Err(bad("PDF reference does not name an active xref object"));
+    };
+    if generation != id.1 {
+        return Err(bad("PDF reference generation is not the active xref entry"));
+    }
+    if offset < 9 || offset >= data.len() {
+        return Err(bad("PDF reference offset is outside the object section"));
+    }
+    let mut lexer = Lexer {
+        data,
+        at: offset,
+        nodes,
+    };
+    if lexer.unsigned()? != id.0 as usize || lexer.unsigned()? != id.1 as usize {
+        return Err(bad("PDF referenced object identity mismatch"));
+    }
+    lexer.keyword(b"obj")?;
+    let value = lexer.value(0)?;
+    if lexer.word()? != b"endobj" {
+        return Err(bad("A PDF stream cannot be used as a plain value"));
+    }
+    Ok((value, lexer.nodes))
+}
+/// Read a dictionary value that PDF may write as an indirect reference to an integer.
+///
+/// A stream `/Length` is allowed to be an indirect reference, and LibreOffice writes that
+/// integer object after the stream using it. Objects are read in file-offset order, so the
+/// object map is still incomplete here, while the xref table already names every offset:
+/// resolve through the xref table, under the same 64-hop and cycle bounds as
+/// `Document::resolve`. The trailer `/Size` is a direct integer by specification; a reference
+/// is still resolved this way so it cannot surface as a malformed integer.
+fn resolve_integer(
+    data: &[u8],
+    entries: &Xref,
+    value: &Value,
+    nodes: usize,
+) -> Result<(usize, usize)> {
+    if !matches!(value, Value::Ref(..)) {
+        return value.integer().map(|integer| (integer, nodes));
+    }
+    let mut nodes = nodes;
+    let mut current = value.clone();
+    let mut seen = BTreeSet::new();
+    while let Value::Ref(number, generation) = &current {
+        let id = (*number, *generation);
+        if seen.len() >= 64 {
+            return Err(limit("PDF reference chain exceeds 64"));
+        }
+        if !seen.insert(id) {
+            return Err(bad("Cyclic PDF reference"));
+        }
+        let (target, consumed) = referenced_value(data, entries, id, nodes)?;
+        nodes = consumed;
+        current = target;
+    }
+    if !matches!(&current, Value::Integer(_)) {
+        return Err(bad(
+            "PDF indirect integer must reference a direct integer object",
+        ));
+    }
+    Ok((current.integer()?, nodes))
+}
 fn object<'a>(
     data: &'a [u8],
     offset: usize,
     id: ObjectId,
     nodes: usize,
+    entries: &Xref,
 ) -> Result<(Object<'a>, usize, usize)> {
     if !data.get(offset).is_some_and(u8::is_ascii_digit) {
         return Err(bad("PDF xref must point exactly to an object header"));
@@ -104,11 +177,13 @@ fn object<'a>(
     let mut stream = None;
     let token = lexer.word()?;
     if token == b"stream" {
-        let length = get(value.dict()?, b"Length")?.integer()?;
+        let (length, consumed) =
+            resolve_integer(data, entries, get(value.dict()?, b"Length")?, lexer.nodes)?;
+        lexer.nodes = consumed;
         if length > MAX_STREAM {
             return Err(limit("PDF encoded stream exceeds 1 MiB"));
         }
-        // Indirect Length is declined before reading stream bytes; no searching for endstream.
+        // The length fixes the stream extent; endstream is verified, never searched for.
         if lexer.data.get(lexer.at..lexer.at + 2) == Some(b"\r\n") {
             lexer.at += 2;
         } else if lexer.data.get(lexer.at) == Some(&b'\n') {
@@ -155,7 +230,7 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         nodes: 0,
     };
     lexer.keyword(b"xref")?;
-    let mut entries = BTreeMap::new();
+    let mut entries: Xref = BTreeMap::new();
     loop {
         lexer.skip();
         if data[lexer.at..].starts_with(b"trailer") {
@@ -203,7 +278,9 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
             ));
         }
     }
-    let size = get(trailer, b"Size")?.integer()?;
+    let (size, consumed) =
+        resolve_integer(&data[..xref], &entries, get(trailer, b"Size")?, lexer.nodes)?;
+    lexer.nodes = consumed;
     if size == 0
         || size > MAX_OBJECTS
         || entries.len() != size
@@ -228,16 +305,16 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         return Err(bad("Unexpected PDF data between trailer and final footer"));
     }
     let mut ordered = Vec::new();
-    for (number, (offset, generation, active)) in entries {
-        if !active {
+    for (number, (offset, generation, active)) in &entries {
+        if !*active {
             continue;
         }
-        if offset < 9 || offset >= xref {
+        if *offset < 9 || *offset >= xref {
             return Err(bad(
                 "Active PDF object offset is outside the object section",
             ));
         }
-        ordered.push((offset, (number as u32, generation)));
+        ordered.push((*offset, (*number as u32, *generation)));
     }
     ordered.sort_unstable();
     let mut previous = 0;
@@ -258,7 +335,7 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
                 "Unindexed data or overlapping comments in PDF object section",
             ));
         }
-        let (item, end, count) = object(&data[..xref], offset, id, nodes)?;
+        let (item, end, count) = object(&data[..xref], offset, id, nodes, &entries)?;
         previous = end;
         nodes = count;
         objects.insert(id, item);
