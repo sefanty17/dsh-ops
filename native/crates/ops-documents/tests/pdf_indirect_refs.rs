@@ -50,6 +50,13 @@ impl Pdf {
     }
 
     fn bytes(&self) -> Vec<u8> {
+        let size = self.objects.len() + 1;
+        self.bytes_with_size(&size.to_string())
+    }
+
+    /// Emit the document with `size_value` written verbatim as the trailer's `/Size`,
+    /// so a caller can pass either a count or a reference such as `6 0 R`.
+    fn bytes_with_size(&self, size_value: &str) -> Vec<u8> {
         let mut pdf = self.header.clone();
         let mut offsets = Vec::with_capacity(self.objects.len());
         for (index, body) in self.objects.iter().enumerate() {
@@ -66,7 +73,7 @@ impl Pdf {
         }
         pdf.extend_from_slice(
             format!(
-                "trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+                "trailer\n<< /Size {size_value} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
             )
             .as_bytes(),
         );
@@ -325,4 +332,196 @@ fn dangling_page_count_reference_is_reported_as_a_reference_error() {
     pdf.object(FONT); // 5
     let error = read_pdf(&pdf.bytes()).expect_err("a dangling /Count must fail");
     assert_clear_reference_error(&error);
+}
+
+/// A reference cycle must name itself, never surface as an integer type error.
+fn assert_cyclic_error(error: &Failure) {
+    assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+    assert!(
+        error.message.contains("Cyclic"),
+        "a reference cycle must be reported as such: {}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("bounded nonnegative"),
+        "a cycle must not be reported as an integer type error: {}",
+        error.message
+    );
+}
+
+#[test]
+fn indirect_trailer_size_is_resolved() {
+    let mut pdf = Pdf::new(b"");
+    pdf.object(CATALOG); // 1
+    pdf.object(pages("1")); // 2
+    pdf.object(page(5, 4)); // 3
+    pdf.object(stream(&CONTENT.len().to_string(), CONTENT)); // 4
+    pdf.object(FONT); // 5
+    pdf.object("7"); // 6: the real /Size value, one past the highest object number
+    assert_reads_hello(
+        &read_pdf(&pdf.bytes_with_size("6 0 R")).expect("indirect /Size must read"),
+    );
+}
+
+#[test]
+fn dangling_trailer_size_reference_is_reported_as_a_reference_error() {
+    let mut pdf = Pdf::new(b"");
+    pdf.object(CATALOG); // 1
+    pdf.object(pages("1")); // 2
+    pdf.object(page(5, 4)); // 3
+    pdf.object(stream(&CONTENT.len().to_string(), CONTENT)); // 4
+    pdf.object(FONT); // 5
+    let error = read_pdf(&pdf.bytes_with_size("9 0 R")).expect_err("a dangling /Size must fail");
+    assert_clear_reference_error(&error);
+}
+
+#[test]
+fn chained_length_reference_is_resolved() {
+    let mut pdf = Pdf::new(b"");
+    pdf.object(CATALOG); // 1
+    pdf.object(pages("1")); // 2
+    pdf.object(page(5, 4)); // 3
+    pdf.object(stream("6 0 R", CONTENT)); // 4: /Length -> 6
+    pdf.object(FONT); // 5
+    pdf.object("7 0 R"); // 6: -> 7
+    pdf.object(CONTENT.len().to_string()); // 7: literal
+    assert_reads_hello(&read_pdf(&pdf.bytes()).expect("chained /Length must read"));
+}
+
+#[test]
+fn cyclic_length_reference_is_reported_as_a_clear_error() {
+    let mut pdf = Pdf::new(b"");
+    pdf.object(CATALOG); // 1
+    pdf.object(pages("1")); // 2
+    pdf.object(page(5, 4)); // 3
+    pdf.object(stream("6 0 R", CONTENT)); // 4
+    pdf.object(FONT); // 5
+    pdf.object("6 0 R"); // 6: refers to itself
+    let error = read_pdf(&pdf.bytes()).expect_err("a cyclic /Length must fail");
+    assert_cyclic_error(&error);
+}
+
+#[test]
+fn cyclic_page_count_reference_is_reported_as_a_clear_error() {
+    let mut pdf = Pdf::new(b"");
+    pdf.object(CATALOG); // 1
+    pdf.object(pages("6 0 R")); // 2
+    pdf.object(page(5, 4)); // 3
+    pdf.object(stream(&CONTENT.len().to_string(), CONTENT)); // 4
+    pdf.object(FONT); // 5
+    pdf.object("6 0 R"); // 6: refers to itself
+    let error = read_pdf(&pdf.bytes()).expect_err("a cyclic /Count must fail");
+    assert_cyclic_error(&error);
+}
+
+#[test]
+fn length_reference_to_a_non_integer_is_reported_as_a_reference_error() {
+    let mut pdf = Pdf::new(b"");
+    pdf.object(CATALOG); // 1
+    pdf.object(pages("1")); // 2
+    pdf.object(page(5, 4)); // 3
+    pdf.object(stream("6 0 R", CONTENT)); // 4
+    pdf.object(FONT); // 5
+    pdf.object("(not a number)"); // 6: a string, not an integer
+    let error = read_pdf(&pdf.bytes()).expect_err("a non-integer /Length target must fail");
+    assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+    assert!(
+        !error.message.contains("bounded nonnegative"),
+        "a non-integer target must not be reported as the generic integer error: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("integer"),
+        "the failure should explain that an integer was required: {}",
+        error.message
+    );
+}
+
+/// True when the byte range contains a `/Length` written as an indirect reference.
+fn has_indirect_length(bytes: &[u8]) -> bool {
+    let needle = b"/Length ";
+    let mut index = 0;
+    while let Some(found) = bytes[index..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        let mut at = index + found + needle.len();
+        let digits = |at: &mut usize| {
+            let start = *at;
+            while *at < bytes.len() && bytes[*at].is_ascii_digit() {
+                *at += 1;
+            }
+            bytes[start..*at].len()
+        };
+        let generation = digits(&mut at) > 0
+            && at < bytes.len()
+            && bytes[at] == b' '
+            && {
+                at += 1;
+                digits(&mut at) > 0
+            }
+            && at + 1 < bytes.len()
+            && bytes[at] == b' '
+            && bytes[at + 1] == b'R';
+        if generation {
+            return true;
+        }
+        index = index + found + needle.len();
+    }
+    false
+}
+
+/// A genuine LibreOffice export, the reporter's production path.
+///
+/// The fixture is a real `soffice --convert-to pdf` output: PDF 1.7, the UTF-8
+/// `%äüöß` second line, and two indirect `/Length` references. It pins two facts:
+/// the container now parses such a file (the #646 fix), and text extraction still
+/// stops at the marked-content operators LibreOffice wraps its text in. The second
+/// assertion is deliberately a pin, not an endorsement: when marked content becomes
+/// traversable this test must change with it.
+#[test]
+fn libreoffice_export_parses_and_pins_the_next_content_gap() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/libreoffice-export.pdf"
+    );
+    let bytes = std::fs::read(fixture).expect("LibreOffice fixture");
+
+    assert!(
+        bytes.starts_with(b"%PDF-1.7\n"),
+        "fixture must stay the LibreOffice export this test was recorded from"
+    );
+    assert_eq!(
+        &bytes[9..18],
+        b"%\xC3\xA4\xC3\xBC\xC3\xB6\xC3\x9F",
+        "fixture must keep the UTF-8 second-line marker"
+    );
+    assert!(
+        has_indirect_length(&bytes),
+        "the fixture must keep at least one indirect /Length, or this test stops covering #646"
+    );
+
+    // The #646 fix: an indirect /Length no longer stops the container parse.
+    let document = ops_documents::pdf_container::parse(&bytes)
+        .expect("a LibreOffice export must parse as a classic-xref PDF");
+    assert!(
+        document.objects.len() > 5,
+        "fixture must carry real objects, got {}",
+        document.objects.len()
+    );
+
+    // Remaining gap: the text layer uses marked content, which this reader declines.
+    let output = read_pdf(&bytes).expect("the reader reports a status instead of failing");
+    assert_eq!(output["status"], "partial", "reader reported {output}");
+    assert_eq!(
+        output["error"]["code"], "UNSUPPORTED_DOCUMENT",
+        "reader reported {output}"
+    );
+    assert!(
+        output["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BMC"),
+        "the pinned gap is marked content: {output}"
+    );
 }
