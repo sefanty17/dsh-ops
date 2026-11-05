@@ -27,8 +27,10 @@ impl CMap {
     /// Read a decoded `ToUnicode` stream.
     ///
     /// Only the mappings are interpreted; every other operator is skipped with its operands.
-    /// `usecmap`, a `/UseCMap` operand, a missing `begincmap`/`endcmap` marker, mixed codespace
-    /// widths and mappings that disagree with the codespace are all rejected.
+    /// `usecmap`, a `/UseCMap` operand, a missing `begincmap`/`endcmap` marker, codespaces with
+    /// mixed code widths, and mappings that disagree with the codespace are all rejected. ISO
+    /// 32000-1 does not order the codespace range before the mappings, so the table is collected
+    /// first and validated once the whole stream has been read.
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut lexer = Lexer::new(data);
         let mut table = Table::default();
@@ -142,13 +144,7 @@ impl CMap {
         if !closed {
             return Err(bad("PDF ToUnicode CMap is missing endcmap"));
         }
-        if table.ranges == 0 {
-            return Err(bad("PDF ToUnicode CMap has no codespace range"));
-        }
-        Ok(Self {
-            width: table.width,
-            targets: table.targets,
-        })
+        table.finish()
     }
     /// Code width in bytes; every code of this CMap has exactly this width.
     pub fn width(&self) -> usize {
@@ -247,11 +243,22 @@ fn step(left: usize) -> Result<usize> {
     left.checked_sub(1)
         .ok_or_else(|| bad("PDF ToUnicode block contains more entries than it declares"))
 }
+/// One collected mapping, validated against the codespace once the stream ends.
+struct Mapping {
+    width: usize,
+    code: u32,
+    destination: Box<str>,
+}
+/// A CMap collected while the stream is read and validated after it ends.
+///
+/// A mapping may precede the codespace range that fixes its code width, so collection applies
+/// the entry and byte budgets but compares no width; [`Table::finish`] is the single validation
+/// pass.
 #[derive(Default)]
 struct Table {
     width: usize,
     ranges: usize,
-    targets: BTreeMap<u32, Box<str>>,
+    mappings: Vec<Mapping>,
     bytes: usize,
 }
 impl Table {
@@ -275,8 +282,9 @@ impl Table {
         if self.width == 0 {
             self.width = low.len();
         } else if self.width != low.len() {
-            return Err(bad(
-                "PDF ToUnicode codespace mixes code widths, so a code cannot be split",
+            return Err(unsupported(
+                "PDF ToUnicode codespace mixes code widths; mixed-width codespaces are \
+                 unsupported because a code cannot be split into characters",
             ));
         }
         self.ranges += 1;
@@ -288,22 +296,25 @@ impl Table {
                 "PDF ToUnicode bfchar entry must be two hexadecimal strings",
             ));
         };
-        self.width_of(source.len())?;
-        let destination = utf16(target)?;
-        self.insert(code(source), destination)
+        self.push(source.len(), code(source), utf16(target)?)
     }
     fn range(&mut self, low: &Value, high: &Value, target: &Value) -> Result<()> {
         let (Value::String(low), Value::String(high)) = (low, high) else {
             return Err(bad("PDF ToUnicode bfrange must start with two bounds"));
         };
-        self.width_of(low.len())?;
-        self.width_of(high.len())?;
+        // Both bounds are codes of the one codespace width, so their widths must agree.
+        if low.len() != high.len() {
+            return Err(bad(
+                "PDF ToUnicode bfrange bounds must be codes of equal width",
+            ));
+        }
+        let width = low.len();
         if low > high {
             return Err(bad("PDF ToUnicode bfrange is inverted"));
         }
         let start = code(low);
         let count = u64::from(code(high)) - u64::from(start) + 1;
-        if self.targets.len() as u64 + count > MAX_ENTRIES as u64 {
+        if self.mappings.len() as u64 + count > MAX_ENTRIES as u64 {
             return Err(limit("PDF ToUnicode CMap exceeds 65536 mappings"));
         }
         match target {
@@ -323,7 +334,7 @@ impl Table {
                     }
                     let mut destination = target.clone();
                     destination[last] = value as u8;
-                    self.insert(start + offset as u32, utf16(&destination)?)?;
+                    self.push(width, start + offset as u32, utf16(&destination)?)?;
                 }
             }
             Value::Array(targets) => {
@@ -338,7 +349,7 @@ impl Table {
                             "PDF ToUnicode bfrange destination array must hold hexadecimal strings",
                         ));
                     };
-                    self.insert(start + offset as u32, utf16(target)?)?;
+                    self.push(width, start + offset as u32, utf16(target)?)?;
                 }
             }
             _ => {
@@ -349,37 +360,50 @@ impl Table {
         }
         Ok(())
     }
-    /// Refuse a code whose width rules out the codespace width established for this CMap.
-    fn width_of(&self, width: usize) -> Result<()> {
-        if self.width == 0 {
-            return Err(bad(
-                "PDF ToUnicode mapping appears before its codespace range",
-            ));
-        }
-        if width != self.width {
-            return Err(bad(format!(
-                "PDF ToUnicode code is {width} bytes but its codespace is {} bytes",
-                self.width
-            )));
-        }
-        Ok(())
-    }
-    fn insert(&mut self, code: u32, destination: String) -> Result<()> {
-        if self.targets.len() >= MAX_ENTRIES {
+    /// Store one mapping under the entry and destination-byte budgets.
+    fn push(&mut self, width: usize, code: u32, destination: String) -> Result<()> {
+        if self.mappings.len() >= MAX_ENTRIES {
             return Err(limit("PDF ToUnicode CMap exceeds 65536 mappings"));
         }
         let cost = destination.len() + ENTRY_BYTES;
         if self.bytes + cost > MAX_BYTES {
             return Err(limit("PDF ToUnicode CMap mappings exceed 1 MiB"));
         }
-        if self.targets.contains_key(&code) {
-            return Err(bad(format!(
-                "Duplicate PDF ToUnicode character code {code:04X}"
-            )));
-        }
-        self.targets.insert(code, destination.into_boxed_str());
+        self.mappings.push(Mapping {
+            width,
+            code,
+            destination: destination.into_boxed_str(),
+        });
         self.bytes += cost;
         Ok(())
+    }
+    /// Validate the collected codespace and mappings, and build the CMap.
+    ///
+    /// This is the only place a mapping's code width is compared with the codespace width, so a
+    /// mapping that appears before its codespace range is still decoded.
+    fn finish(self) -> Result<CMap> {
+        if self.ranges == 0 {
+            return Err(bad("PDF ToUnicode CMap has no codespace range"));
+        }
+        let mut targets = BTreeMap::new();
+        for mapping in self.mappings {
+            if mapping.width != self.width {
+                return Err(bad(format!(
+                    "PDF ToUnicode code is {} bytes but its codespace is {} bytes",
+                    mapping.width, self.width
+                )));
+            }
+            if targets.insert(mapping.code, mapping.destination).is_some() {
+                return Err(bad(format!(
+                    "Duplicate PDF ToUnicode character code {:04X}",
+                    mapping.code
+                )));
+            }
+        }
+        Ok(CMap {
+            width: self.width,
+            targets,
+        })
     }
 }
 /// Big-endian character code of at most four bytes; the split and the CMap keys share it.
@@ -549,11 +573,34 @@ mod tests {
             "DOCUMENT_PARSE_ERROR",
         );
         assert!(message.contains("1 bytes but its codespace is 2 bytes"), "{message}");
+        // The mapping is still checked when it precedes the codespace range.
+        let message = rejected_raw(
+            "1 beginbfchar\n<0041> <0059>\nendbfchar\n\
+             1 begincodespacerange\n<00> <FF>\nendcodespacerange",
+            "DOCUMENT_PARSE_ERROR",
+        );
+        assert!(message.contains("2 bytes but its codespace is 1 bytes"), "{message}");
+        // A CMap without a codespace range cannot split its codes into characters.
         let message = rejected_raw(
             "1 beginbfchar\n<0001> <0041>\nendbfchar",
             "DOCUMENT_PARSE_ERROR",
         );
-        assert!(message.contains("before its codespace range"), "{message}");
+        assert!(message.contains("no codespace range"), "{message}");
+    }
+    #[test]
+    fn mappings_may_precede_the_codespace_range_that_defines_their_width() {
+        // ISO 32000-1 does not order begincodespacerange before the mapping blocks.
+        let table = CMap::parse(&raw(
+            "1 beginbfchar\n<0001> <0059>\nendbfchar\n\
+             1 beginbfrange\n<0002> <0003> <0041>\nendbfrange\n\
+             1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange",
+        ))
+        .unwrap();
+        assert_eq!(table.width(), 2);
+        assert_eq!(table.entries(), 3);
+        assert_eq!(table.target(1), Some("Y"));
+        assert_eq!(table.target(2), Some("A"));
+        assert_eq!(table.target(3), Some("B"));
     }
     #[test]
     fn malformed_destinations_are_rejected() {
@@ -682,9 +729,15 @@ mod tests {
             "2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange",
         ))
         .err().expect("mixed code widths cannot be split");
-        assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+        // ISO 32000-1 section 9.7.6 permits several code lengths; this reader is what does not.
+        assert_eq!(error.code, "UNSUPPORTED_DOCUMENT", "{}", error.message);
         assert!(
             error.message.contains("mixes code widths"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("unsupported"),
             "{}",
             error.message
         );
@@ -713,7 +766,7 @@ mod tests {
         let mut table = Table::default();
         let mut failure = None;
         for code in 0..MAX_ENTRIES as u32 {
-            match table.insert(code, "x".repeat(MAX_TARGET)) {
+            match table.push(2, code, "x".repeat(MAX_TARGET)) {
                 Ok(()) => {}
                 Err(error) => {
                     failure = Some(error);
@@ -724,7 +777,7 @@ mod tests {
         let error = failure.expect("the mapping memory budget must end the insert loop");
         assert_eq!(error.code, "OUTPUT_LIMIT", "{}", error.message);
         assert!(error.message.contains("1 MiB"), "{}", error.message);
-        assert!(table.targets.len() < MAX_ENTRIES);
+        assert!(table.mappings.len() < MAX_ENTRIES);
         // The same CMap path: a declared block larger than the entry budget is refused up front.
         let error = parse(TWO, "65537 beginbfchar\nendbfchar").err().expect("too many declared entries");
         assert_eq!(error.code, "OUTPUT_LIMIT", "{}", error.message);

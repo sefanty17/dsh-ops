@@ -1,7 +1,8 @@
 //! PDF text operators over decoded character codes. No glyph substitution or layout inference.
 use crate::{
-    pdf_container::{Document, ObjectId, decode, get},
+    pdf_container::{Document, ObjectId, get},
     pdf_font::FontDecoder,
+    pdf_limits::MAX_TEXT,
     pdf_pages::MAX_DECODED,
     pdf_syntax::{Lexer, Value, bad, limit, unsupported},
 };
@@ -11,7 +12,6 @@ use std::{
     rc::Rc,
     time::{Duration, Instant},
 };
-pub const MAX_TEXT: usize = 1024 * 1024;
 /// Fonts whose character-code tables one document may decode.
 pub const MAX_FONTS: usize = 64;
 pub fn deadline(started: Instant) -> Result<()> {
@@ -47,10 +47,10 @@ impl Fonts {
     }
     /// The decoder for one `/Font` resource, built once per font object.
     ///
-    /// `decoded` is the document's decoded-stream budget: the `ToUnicode` table this font reads
-    /// is charged to it, so a document cannot buy decompression work by spreading large tables
-    /// over many fonts. An inline font dictionary is charged on every selection because it has
-    /// no object identity to cache, which is the work showing text with it really costs.
+    /// `decoded` is the document's decoded-stream budget: the `ToUnicode` bytes the new decoder
+    /// reports are charged to it, so a document cannot buy decompression work by spreading large
+    /// tables over many fonts. An inline font dictionary is charged on every selection because it
+    /// has no object identity to cache, which is the work showing text with it really costs.
     fn decoder(
         &mut self,
         doc: &Document<'_>,
@@ -66,8 +66,12 @@ impl Fonts {
                 return Err(limit("PDF document selects more than 64 distinct fonts"));
             }
         }
-        charge(doc, value, decoded)?;
         let decoder = Rc::new(FontDecoder::from_value(doc, value)?);
+        let size = decoder.decoded_bytes();
+        if *decoded + size > MAX_DECODED {
+            return Err(limit("PDF aggregate decoded streams exceed 16 MiB"));
+        }
+        *decoded += size;
         if let Some(id) = id {
             self.cache.insert(id, Rc::clone(&decoder));
         }
@@ -80,27 +84,6 @@ fn font_object(value: &Value) -> Option<ObjectId> {
         Value::Ref(number, generation) => Some((*number, *generation)),
         _ => None,
     }
-}
-/// Charge one font's `ToUnicode` table to the document's decoded-stream budget.
-///
-/// `FontDecoder` decodes that stream itself and reports no size, so the cache decodes the table
-/// here first: an over-budget document must fail before another table is decoded and parsed.
-fn charge(doc: &Document<'_>, value: &Value, decoded: &mut usize) -> Result<()> {
-    let font = doc.resolve(value)?.dict()?;
-    let Some(Value::Ref(number, generation)) = font.get(b"ToUnicode".as_slice()) else {
-        return Ok(());
-    };
-    let object = doc.object((*number, *generation))?;
-    if object.stream.is_none() {
-        // `FontDecoder` reports the malformed mapping; this stream decodes nothing.
-        return Ok(());
-    }
-    let size = decode(object)?.len();
-    if *decoded + size > MAX_DECODED {
-        return Err(limit("PDF aggregate decoded streams exceed 16 MiB"));
-    }
-    *decoded += size;
-    Ok(())
 }
 fn numeric(value: &Value) -> bool {
     matches!(value, Value::Integer(_) | Value::Number(_))
@@ -321,9 +304,6 @@ pub fn extract(
             }
             b"q" => {
                 no_args(&args)?;
-                if inside {
-                    return Err(unsupported("PDF q inside a text object is unsupported"));
-                }
                 if stack.len() >= 64 {
                     return Err(limit("PDF graphics state exceeds depth 64"));
                 }
@@ -331,9 +311,6 @@ pub fn extract(
             }
             b"Q" => {
                 no_args(&args)?;
-                if inside {
-                    return Err(unsupported("PDF Q inside a text object is unsupported"));
-                }
                 selected = stack.pop().ok_or_else(|| bad("Unbalanced PDF Q"))?
             }
             b"cm" | b"c" => numbers(&args, 6)?,
@@ -493,11 +470,20 @@ mod tests {
         objects: &[String],
         content: &[u8],
     ) -> Result<(Vec<String>, usize)> {
+        extract_spending(fonts, objects, content, 0)
+    }
+    /// Extract `content` while `spent` decoded bytes are already charged to the shared budget.
+    fn extract_spending(
+        fonts: &str,
+        objects: &[String],
+        content: &[u8],
+        spent: usize,
+    ) -> Result<(Vec<String>, usize)> {
         let bytes = document_with(fonts, objects);
         let document = parse(&bytes).unwrap();
         let page = document.object((3, 0)).unwrap().value.dict().unwrap();
         let mut cached = Fonts::new();
-        let mut decoded = 0;
+        let mut decoded = spent;
         let runs = extract(
             &document,
             page.get(b"Resources".as_slice()),
@@ -553,6 +539,31 @@ mod tests {
             CMAP_BODY.len(),
             "the same font object must be decoded and charged once"
         );
+    }
+    #[test]
+    fn a_font_table_is_charged_once_against_the_shared_decoded_budget() {
+        let objects = to_unicode_font();
+        let content = b"BT /F1 12 Tf <0102> Tj ET";
+        // One byte short of the table's decoded size leaves no room for it.
+        let error = extract_spending(
+            "<< /F1 4 0 R >>",
+            &objects,
+            content,
+            MAX_DECODED - CMAP_BODY.len() + 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "OUTPUT_LIMIT", "{}", error.message);
+        assert!(error.message.contains("16 MiB"), "{}", error.message);
+        // The exact remaining budget accepts the table and charges its decoded length once.
+        let (runs, decoded) = extract_spending(
+            "<< /F1 4 0 R >>",
+            &objects,
+            content,
+            MAX_DECODED - CMAP_BODY.len(),
+        )
+        .unwrap();
+        assert_eq!(runs, ["Q3"]);
+        assert_eq!(decoded, MAX_DECODED);
     }
     #[test]
     fn more_than_64_selected_fonts_exceed_the_font_budget() {
@@ -660,6 +671,8 @@ mod tests {
             b"BT /F1 12 Tf (A) Tj /Im1 Do ET".as_slice(),
             b"BT /F1 12 Tf (A) Tj BI /W 1 /H 1 ID x EI ET",
             b"BT /F1 12 Tf (A) Tj 0 0 m 1 1 l S ET",
+            b"BT /F1 12 Tf (A) Tj q ET",
+            b"BT /F1 12 Tf (A) Tj Q ET",
         ] {
             let error = extract_text(content).unwrap_err();
             assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);

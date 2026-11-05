@@ -4,6 +4,7 @@ mod archive;
 mod pdf_syntax;
 mod pdf_cmap;
 mod pdf_font;
+mod pdf_limits;
 mod pdf_text;
 mod pdf;
 mod pdf_pages;

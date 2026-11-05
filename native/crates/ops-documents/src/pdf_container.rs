@@ -23,7 +23,7 @@ pub const MAX_FILE: usize = 16 * 1024 * 1024;
 pub const MAX_OBJECTS: usize = 10_000;
 pub const MAX_STREAM: usize = 1024 * 1024;
 /// Decoded bytes of cross-reference streams and object streams, in aggregate.
-pub const MAX_DECODED: usize = 8 * 1024 * 1024;
+pub const MAX_XREF_DECODED: usize = 8 * 1024 * 1024;
 /// Objects one object stream may hold.
 pub const MAX_OBJECT_STREAM_OBJECTS: usize = 4096;
 /// Object streams one `/N` or `/First` chain may expand into each other. Both values are direct
@@ -515,7 +515,7 @@ impl<'a> Loader<'a> {
             decode(object)?
         };
         self.decoded = self.decoded.saturating_add(decoded.len());
-        if self.decoded > MAX_DECODED {
+        if self.decoded > MAX_XREF_DECODED {
             return Err(limit("PDF decoded xref and object streams exceed 8 MiB"));
         }
         let mut charge = |nodes: usize| self.charge(nodes);

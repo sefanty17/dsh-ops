@@ -7,10 +7,11 @@
 use crate::{
     pdf_cmap::{CMap, code},
     pdf_container::{Document, decode, get},
+    pdf_limits::MAX_TEXT,
     pdf_syntax::{Dict, Value, bad, limit, unsupported},
-    pdf_text::MAX_TEXT,
 };
 use ops_protocol::Result;
+use std::collections::BTreeSet;
 /// How a PDF font supplies Unicode for its character codes; `decode` never branches on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(test)]
@@ -27,6 +28,8 @@ pub enum Kind {
 /// One font's character codes and the Unicode text each code produces.
 pub struct FontDecoder {
     codes: Codes,
+    /// Decoded `ToUnicode` stream bytes this decoder read.
+    decoded_bytes: usize,
 }
 enum Codes {
     Identity(CMap),
@@ -74,6 +77,13 @@ impl FontDecoder {
             _ => 1,
         }
     }
+    /// Decoded `ToUnicode` stream bytes this decoder read when it was built.
+    ///
+    /// The text layer charges this to the document's decoded-stream budget, so the table is
+    /// decompressed once; a font whose codes come from a named or built-in encoding reports zero.
+    pub fn decoded_bytes(&self) -> usize {
+        self.decoded_bytes
+    }
     /// Decode one text-showing string.
     ///
     /// A code the font does not map, and a string whose length is not a whole number of codes,
@@ -116,8 +126,8 @@ impl FontDecoder {
 }
 /// A Type0 font reaches Unicode only through `ToUnicode`; its descendant font is not needed.
 fn identity(doc: &Document<'_>, font: &Dict) -> Result<FontDecoder> {
-    match font.get(b"Encoding".as_slice()) {
-        Some(Value::Name(encoding)) if encoding == b"Identity-H" || encoding == b"Identity-V" => {}
+    match encoding(doc, font)? {
+        Some(Encoding::Name(name)) if name == b"Identity-H" || name == b"Identity-V" => {}
         Some(_) => {
             return Err(unsupported(
                 "PDF Type0 font requires the predefined Identity-H or Identity-V encoding; \
@@ -132,7 +142,7 @@ fn identity(doc: &Document<'_>, font: &Dict) -> Result<FontDecoder> {
              Unicode information",
         ));
     };
-    let cmap = to_unicode(doc, value)?;
+    let (cmap, decoded_bytes) = to_unicode(doc, value)?;
     if cmap.width() != 2 {
         return Err(unsupported(format!(
             "PDF Type0 Identity ToUnicode codespace is {} bytes wide; the encoding defines \
@@ -142,12 +152,13 @@ fn identity(doc: &Document<'_>, font: &Dict) -> Result<FontDecoder> {
     }
     Ok(FontDecoder {
         codes: Codes::Identity(cmap),
+        decoded_bytes,
     })
 }
 /// A simple font is decoded from its `ToUnicode` CMap, else from its named encoding.
 fn simple(doc: &Document<'_>, font: &Dict) -> Result<FontDecoder> {
     if let Some(value) = font.get(b"ToUnicode".as_slice()) {
-        let cmap = to_unicode(doc, value)?;
+        let (cmap, decoded_bytes) = to_unicode(doc, value)?;
         if cmap.width() != 1 {
             return Err(unsupported(format!(
                 "PDF simple font ToUnicode codespace is {} bytes wide; a simple font shows \
@@ -157,24 +168,62 @@ fn simple(doc: &Document<'_>, font: &Dict) -> Result<FontDecoder> {
         }
         return Ok(FontDecoder {
             codes: Codes::ToUnicode(cmap),
+            decoded_bytes,
         });
     }
-    match font.get(b"Encoding".as_slice()) {
-        Some(Value::Name(name)) if name == b"WinAnsiEncoding" => Ok(FontDecoder {
+    match encoding(doc, font)? {
+        Some(Encoding::Name(name)) if name == b"WinAnsiEncoding" => Ok(FontDecoder {
             codes: Codes::WinAnsi,
+            decoded_bytes: 0,
         }),
-        Some(Value::Name(name)) => Err(unsupported(format!(
+        Some(Encoding::Name(name)) => Err(unsupported(format!(
             "PDF font encoding /{} is unsupported without a ToUnicode mapping",
             String::from_utf8_lossy(name)
         ))),
-        Some(_) => Err(unsupported(
+        Some(Encoding::Unsupported) => Err(unsupported(
             "PDF font encodings with character differences or indirect CMaps are unsupported \
              without a ToUnicode mapping",
         )),
         None => Ok(FontDecoder {
             codes: builtin(font)?,
+            decoded_bytes: 0,
         }),
     }
+}
+/// A font dictionary's `/Encoding` entry, with indirect references followed.
+enum Encoding<'a> {
+    /// A predefined encoding name.
+    Name(&'a [u8]),
+    /// A differences dictionary or a CMap stream, neither of which this reader interprets.
+    Unsupported,
+}
+/// The `/Encoding` entry of `font`, which may be an indirect reference.
+///
+/// A stream target is a CMap. `Document::resolve` refuses a stream as a plain value, which would
+/// report a legal encoding as malformed, so this walk reports one as unsupported instead.
+fn encoding<'a>(doc: &'a Document<'_>, font: &'a Dict) -> Result<Option<Encoding<'a>>> {
+    let Some(value) = font.get(b"Encoding".as_slice()) else {
+        return Ok(None);
+    };
+    let mut current = value;
+    let mut seen = BTreeSet::new();
+    while let Value::Ref(number, generation) = current {
+        if seen.len() >= 64 {
+            return Err(limit("PDF reference chain exceeds 64"));
+        }
+        if !seen.insert((*number, *generation)) {
+            return Err(bad("Cyclic PDF reference"));
+        }
+        let object = doc.object((*number, *generation))?;
+        if object.stream.is_some() {
+            return Ok(Some(Encoding::Unsupported));
+        }
+        current = &object.value;
+    }
+    Ok(Some(match current {
+        Value::Name(name) => Encoding::Name(name),
+        _ => Encoding::Unsupported,
+    }))
 }
 /// Built-in encoding of a plain standard Latin Type1 font, the only font PDF defines one for.
 fn builtin(font: &Dict) -> Result<Codes> {
@@ -200,7 +249,10 @@ fn builtin(font: &Dict) -> Result<Codes> {
     }
 }
 /// Decode the `ToUnicode` CMap stream of a font dictionary.
-fn to_unicode(doc: &Document<'_>, value: &Value) -> Result<CMap> {
+///
+/// Returns the mapping with the decoded stream length, which the text layer charges to the
+/// document's decoded-stream budget.
+fn to_unicode(doc: &Document<'_>, value: &Value) -> Result<(CMap, usize)> {
     let Value::Ref(number, generation) = value else {
         return Err(bad("PDF ToUnicode mapping must be an indirect stream"));
     };
@@ -213,14 +265,14 @@ fn to_unicode(doc: &Document<'_>, value: &Value) -> Result<CMap> {
             "PDF ToUnicode CMaps that inherit mappings through /UseCMap are unsupported",
         ));
     }
-    CMap::parse(&decode(object)?)
+    let decoded = decode(object)?;
+    let decoded_bytes = decoded.len();
+    Ok((CMap::parse(&decoded)?, decoded_bytes))
 }
-/// ISO 32000-1 Annex D WinAnsi table.
+/// ISO 32000-1 Annex D WinAnsiEncoding table.
 ///
-/// This is the single WinAnsi table in the crate: the classic standard-encoding path in
-/// `pdf_text` should call it instead of carrying its own copy.
+/// Annex D differs from a generic CP1252 decoder at the bullet, space and hyphen slots.
 pub fn winansi(byte: u8) -> Result<char> {
-    // Annex D differs from a generic CP1252 decoder at the bullet, space and hyphen slots.
     const C1: [char; 32] = [
         '€', '•', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '•', 'Ž', '•', '•', '‘',
         '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '•', 'ž', 'Ÿ',
@@ -264,23 +316,18 @@ mod tests {
     use super::*;
     use crate::pdf_container::parse;
     const HELVETICA: &str = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
-    /// One-page PDF whose `/F1` resource is `font`; `cmap` becomes the `ToUnicode` stream of 5 0 R.
-    fn document(font: &str, cmap: Option<(&[u8], &str)>) -> Vec<u8> {
-        let mut objects = vec![
+    /// One-page PDF whose `/F1` resource is `font`; `objects` become `5 0 obj` onward.
+    fn document_with(font: &str, objects: &[Vec<u8>]) -> Vec<u8> {
+        let mut all = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
             b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> >>".to_vec(),
             font.as_bytes().to_vec(),
         ];
-        if let Some((body, extra)) = cmap {
-            let mut object = format!("<< /Length {} {extra}>>\nstream\n", body.len()).into_bytes();
-            object.extend_from_slice(body);
-            object.extend_from_slice(b"\nendstream");
-            objects.push(object);
-        }
+        all.extend(objects.iter().cloned());
         let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
         let mut offsets = vec![0];
-        for (index, object) in objects.iter().enumerate() {
+        for (index, object) in all.iter().enumerate() {
             offsets.push(pdf.len());
             pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
             pdf.extend_from_slice(object);
@@ -302,6 +349,20 @@ mod tests {
         );
         pdf
     }
+    /// One stream object holding `body`, with dictionary keys `extra`.
+    fn stream_object(body: &[u8], extra: &str) -> Vec<u8> {
+        let mut object = format!("<< /Length {} {extra}>>\nstream\n", body.len()).into_bytes();
+        object.extend_from_slice(body);
+        object.extend_from_slice(b"\nendstream");
+        object
+    }
+    /// One-page PDF whose `/F1` resource is `font`; `cmap` becomes the `ToUnicode` stream of 5 0 R.
+    fn document(font: &str, cmap: Option<(&[u8], &str)>) -> Vec<u8> {
+        match cmap {
+            Some((body, extra)) => document_with(font, &[stream_object(body, extra)]),
+            None => document_with(font, &[]),
+        }
+    }
     /// A CMap over the given codespace with `body` after it.
     fn cmap(codespace: &str, body: &str) -> Vec<u8> {
         format!(
@@ -311,6 +372,12 @@ mod tests {
         )
         .into_bytes()
     }
+    /// Build a decoder for the `/F1` font of a one-page document with `objects` after the font.
+    fn decoder_with(font: &str, objects: &[Vec<u8>]) -> Result<FontDecoder> {
+        let bytes = document_with(font, objects);
+        let pdf = parse(&bytes).expect("the fixture document must parse");
+        FontDecoder::from_value(&pdf, &Value::Ref(4, 0))
+    }
     /// Build a decoder for the `/F1` font of a one-page document.
     fn decoder(font: &str, to_unicode: Option<(&[u8], &str)>) -> Result<FontDecoder> {
         let bytes = document(font, to_unicode);
@@ -319,6 +386,13 @@ mod tests {
     }
     fn rejected(font: &str, cmap: Option<(&[u8], &str)>, code: &str) -> String {
         let error = decoder(font, cmap).err().expect("the font must be rejected");
+        assert_eq!(error.code, code, "{}", error.message);
+        error.message
+    }
+    fn rejected_with(font: &str, objects: &[Vec<u8>], code: &str) -> String {
+        let error = decoder_with(font, objects)
+            .err()
+            .expect("the font must be rejected");
         assert_eq!(error.code, code, "{}", error.message);
         error.message
     }
@@ -372,6 +446,78 @@ mod tests {
         assert_eq!(decoder.kind(), Kind::ToUnicode);
         assert_eq!(decoder.code_width(), 1);
         assert_eq!(decoder.decode(&[1, 2]).unwrap(), "Q3");
+    }
+    #[test]
+    fn a_to_unicode_table_reports_the_bytes_it_decoded() {
+        let table = cmap("<00> <FF>", "1 beginbfchar\n<01> <0051>\nendbfchar");
+        let mapped = decoder(SIMPLE, Some((table.as_slice(), ""))).unwrap();
+        assert_eq!(mapped.decoded_bytes(), table.len());
+        // A named encoding reads no stream and reports nothing.
+        let named = decoder(HELVETICA, None).unwrap();
+        assert_eq!(named.decoded_bytes(), 0);
+    }
+    const INDIRECT_WINANSI: &str = "<< /Type /Font /Subtype /TrueType /BaseFont /BCDEEE+Calibri \
+                                    /Encoding 5 0 R >>";
+    #[test]
+    fn an_indirect_encoding_name_selects_its_decoding() {
+        let decoder = decoder_with(INDIRECT_WINANSI, &[b"/WinAnsiEncoding".to_vec()]).unwrap();
+        assert_eq!(decoder.kind(), Kind::WinAnsi);
+        assert_eq!(decoder.code_width(), 1);
+        assert_eq!(decoder.decode(&[0x91, 0x92]).unwrap(), "‘’");
+        assert_eq!(decoder.decoded_bytes(), 0);
+        // A chain of references reaches the name too.
+        let decoder = decoder_with(
+            INDIRECT_WINANSI,
+            &[b"6 0 R".to_vec(), b"/WinAnsiEncoding".to_vec()],
+        )
+        .unwrap();
+        assert_eq!(decoder.kind(), Kind::WinAnsi);
+        // A Type0 font may also name Identity-H indirectly.
+        let table = cmap("<0000> <FFFF>", "1 beginbfchar\n<0001> <0041>\nendbfchar");
+        let font = "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 5 0 R \
+                    /ToUnicode 6 0 R >>";
+        let decoder =
+            decoder_with(font, &[b"/Identity-H".to_vec(), stream_object(&table, "")]).unwrap();
+        assert_eq!(decoder.kind(), Kind::Identity);
+        assert_eq!(decoder.decoded_bytes(), table.len());
+        assert_eq!(decoder.decode(&[0x00, 0x01]).unwrap(), "A");
+    }
+    #[test]
+    fn indirect_encodings_that_are_not_predefined_names_are_unsupported() {
+        let message = rejected_with(
+            INDIRECT_WINANSI,
+            &[b"<< /Type /Encoding /Differences [65 /A] >>".to_vec()],
+            "UNSUPPORTED_DOCUMENT",
+        );
+        assert!(message.contains("character differences"), "{message}");
+        // A CMap stream is a legal indirect /Encoding, but this reader does not interpret one;
+        // it must not surface as a malformed dictionary value.
+        let stream = stream_object(b"begincmap endcmap", "");
+        let message = rejected_with(INDIRECT_WINANSI, &[stream], "UNSUPPORTED_DOCUMENT");
+        assert!(message.contains("indirect CMaps"), "{message}");
+        // The walk sees a stream at the end of a reference chain too.
+        let message = rejected_with(
+            INDIRECT_WINANSI,
+            &[b"6 0 R".to_vec(), stream_object(b"begincmap endcmap", "")],
+            "UNSUPPORTED_DOCUMENT",
+        );
+        assert!(message.contains("indirect CMaps"), "{message}");
+        let message = rejected_with(
+            INDIRECT_WINANSI,
+            &[b"/MacRomanEncoding".to_vec()],
+            "UNSUPPORTED_DOCUMENT",
+        );
+        assert!(message.contains("/MacRomanEncoding"), "{message}");
+        // The Type0 path classifies an indirect CMap stream the same way.
+        let font = "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 5 0 R >>";
+        let message = rejected_with(
+            font,
+            &[stream_object(b"begincmap endcmap", "")],
+            "UNSUPPORTED_DOCUMENT",
+        );
+        assert!(message.contains("CMaps are unsupported"), "{message}");
+        // A dangling reference keeps its reference failure.
+        rejected_with(INDIRECT_WINANSI, &[], "DOCUMENT_PARSE_ERROR");
     }
     #[test]
     fn type0_identity_without_a_to_unicode_mapping_is_unsupported() {
