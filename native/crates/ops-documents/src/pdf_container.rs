@@ -3,8 +3,8 @@
 //!
 //! Every structure is bounded before it is trusted: a 16 MiB file, 10 000 objects, 1 MiB per
 //! encoded or decoded stream, 8 MiB of decoded xref and object streams, 4096 objects per object
-//! stream, and a 20-second container deadline. A malformed structure is a structured failure,
-//! never a recovered guess.
+//! stream, eight nested object-stream expansions, 64 nested object reads, and a 20-second
+//! container deadline. A malformed structure is a structured failure, never a recovered guess.
 //!
 //! Exactly one cross-reference section is read, and it must end at the final footer. A trailer
 //! that names `/Prev` or `/XRefStm` describes an incremental update, which this container
@@ -26,6 +26,13 @@ pub const MAX_STREAM: usize = 1024 * 1024;
 pub const MAX_DECODED: usize = 8 * 1024 * 1024;
 /// Objects one object stream may hold.
 pub const MAX_OBJECT_STREAM_OBJECTS: usize = 4096;
+/// Object streams one `/N` or `/First` chain may expand into each other. Both values are direct
+/// integers in every supported producer; an indirect one that reaches another object stream is
+/// bounded instead of recursing.
+pub const MAX_OBJECT_STREAM_DEPTH: usize = 8;
+/// Objects one indirect `/Length` chain may hold in flight. Parsing a referenced stream resolves
+/// its own `/Length` first, so each link nests one read.
+const MAX_NESTED_OBJECT_READS: usize = 64;
 const CONTAINER_DEADLINE: Duration = Duration::from_secs(20);
 pub type ObjectId = (u32, u16);
 /// One cross-reference entry, from a classic table or a stream.
@@ -334,6 +341,9 @@ struct Loader<'a> {
     expanded: BTreeMap<u32, Vec<(u32, Value)>>,
     ranges: Vec<(usize, usize)>,
     resolving: BTreeSet<ObjectId>,
+    /// Object streams whose `/N` and `/First` are being resolved. Its length is the current
+    /// expansion depth.
+    expanding: BTreeSet<u32>,
     decoded: usize,
     nodes: usize,
     started: Instant,
@@ -418,6 +428,9 @@ impl<'a> Loader<'a> {
             return Ok(());
         }
         check_deadline(self.started)?;
+        if self.resolving.len() >= MAX_NESTED_OBJECT_READS {
+            return Err(limit("PDF object reads nest more than 64 deep"));
+        }
         if !self.resolving.insert(id) {
             return Err(bad("PDF streams cannot resolve each other's length"));
         }
@@ -440,11 +453,36 @@ impl<'a> Loader<'a> {
         Ok(())
     }
     /// Expand one `/Type /ObjStm` stream into its inner objects, in stream order.
+    ///
+    /// `/N` and `/First` may be indirect and may name an object another object stream holds, so
+    /// expansion re-enters here. `expanding` records every stream whose expansion is in progress
+    /// before any of its values is resolved: a reference back into one of them is a cycle, and its
+    /// length is the nesting depth this method bounds.
     fn expand(&mut self, stream: u32) -> Result<()> {
         if self.expanded.contains_key(&stream) {
             return Ok(());
         }
         check_deadline(self.started)?;
+        if self.expanding.contains(&stream) {
+            return Err(bad(
+                "Cyclic PDF object stream expansion through /N or /First",
+            ));
+        }
+        if self.expanding.len() >= MAX_OBJECT_STREAM_DEPTH {
+            return Err(Failure::new(
+                "OUTPUT_LIMIT",
+                format!(
+                    "PDF object stream expansion exceeds {MAX_OBJECT_STREAM_DEPTH} nested streams"
+                ),
+            ));
+        }
+        self.expanding.insert(stream);
+        let result = self.expand_stream(stream);
+        self.expanding.remove(&stream);
+        result
+    }
+    /// Expand `stream`; [`Loader::expand`] owns the cycle and depth guard.
+    fn expand_stream(&mut self, stream: u32) -> Result<()> {
         let id = (stream, 0u16);
         let offset = match *self
             .entries
@@ -546,6 +584,7 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         expanded: BTreeMap::new(),
         ranges: Vec::new(),
         resolving: BTreeSet::new(),
+        expanding: BTreeSet::new(),
         decoded: 0,
         nodes: 0,
         started,
