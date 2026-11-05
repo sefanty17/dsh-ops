@@ -191,9 +191,11 @@ impl<'a> Lexer<'a> {
     ///
     /// `/Prev` and `/XRefStm` only describe an incremental update while they are
     /// trailer keys, and an outline item legitimately carries `/Prev` as its
-    /// previous sibling. Those two are therefore refused where a trailer is read
-    /// (`pdf_container::parse`), not here; `/Encrypt`, `/ObjStm` and `/XRef`
-    /// stay refused at the token because no supported structure can hold them.
+    /// previous sibling. The container reads `/Prev`, `/XRefStm`, `/ObjStm` and
+    /// `/XRef` where they are meaningful (incremental chains, hybrid tables,
+    /// object and xref streams) instead of the lexer refusing them here.
+    /// `/Encrypt` is the one name no supported structure can carry: every string
+    /// and stream in an encrypted file is unreadable without the password.
     fn name(&mut self) -> Result<Vec<u8>> {
         self.at += 1;
         let mut name = Vec::new();
@@ -220,10 +222,8 @@ impl<'a> Lexer<'a> {
                 return Err(limit("PDF name exceeds 256 bytes"));
             }
         }
-        if matches!(name.as_slice(), b"Encrypt" | b"ObjStm" | b"XRef") {
-            return Err(unsupported(
-                "Encrypted, incremental, object-stream and xref-stream PDFs are unsupported",
-            ));
+        if name.as_slice() == b"Encrypt" {
+            return Err(unsupported("Encrypted PDFs are unsupported"));
         }
         Ok(name)
     }

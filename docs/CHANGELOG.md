@@ -156,6 +156,31 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Inspect Windows Bash image and ancestor integrity labels in `ladder`, warn about Low labels, and keep unreadable labels and runtime health distinct from static payload compatibility (#446).
 - `ladder` 只读检查 Windows Bash 映像与祖先路径的完整性标签，告警 Low 标签，并区分不可读标签、运行时健康和静态载荷兼容性（#446）。
 
+- Read PDFs whose stream `/Length`, trailer `/Size` or page-tree `/Count` is an indirect
+  reference: resolve the chain through the xref table with bounded hops and cycle detection
+  instead of failing with "Expected a bounded nonnegative PDF integer".
+- Read PDF pages whose text is wrapped in marked content or preceded by graphics-state
+  operators: skip `BMC`/`BDC`/`EMC` and the graphics-state/colour operators that do not emit
+  glyphs, instead of failing the page. WPS and Chrome exports now reach the font layer rather
+  than an operator error; forms, inline images and shading remain unsupported.
+- Read PDFs whose text layer uses an embedded or CID font: Type0/Identity-H/V fonts and simple
+  fonts carrying a `ToUnicode` CMap now map character codes to Unicode, where only standard
+  Type1 encodings were decoded before. Glyph programs, `DescendantFonts` and `CIDToGIDMap`
+  are never read.
+- Read PDFs with modern cross-reference structures: cross-reference streams (`/Type /XRef`
+  with `/W` and `/Index`), object streams (`/Type /ObjStm`), hybrid `/XRefStm` tables and
+  incremental `/Prev` chains are merged into one bounded table instead of refusing the file.
+- 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
+  带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败。
+- 读取文本被标记内容包裹、或前置图形状态操作符的 PDF 页面：跳过 `BMC`/`BDC`/`EMC` 以及不产生
+  字形的图形状态/颜色操作符，不再整页失败。WPS 与 Chrome 导出的文件现在会进入字体层而非报操作符
+  错误；表单、内联图片与渐变仍不支持。
+- 读取文本层使用嵌入字体或 CID 字体的 PDF：Type0/Identity-H/V 字体与带 `ToUnicode` CMap 的简单
+  字体现在能把字符码映射为 Unicode，此前只解码标准 Type1 编码；字形程序、`DescendantFonts` 与
+  `CIDToGIDMap` 仍不读取。
+- 读取使用现代交叉引用结构的 PDF：xref 流（`/Type /XRef`，含 `/W`、`/Index`）、对象流
+  （`/Type /ObjStm`）、混合 `/XRefStm` 表与增量 `/Prev` 链合并为一张有界表，不再拒绝整份文件。
+
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 
 - This unstable prerelease summarizes changes since v0.5.0-alpha2; use an isolated test environment.
@@ -282,13 +307,6 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   sessions' discovery selections intact and authorize external calls only in their owned wrapper.
 - Diagnose the selected discovery/shell services and scoped publication; clarify the host's
   ancestor-registration/restriction limit for nested unrelated preset integrations.
-- Read PDFs whose stream `/Length`, trailer `/Size` or page-tree `/Count` is an indirect
-  reference: resolve the chain through the xref table with bounded hops and cycle detection
-  instead of failing with "Expected a bounded nonnegative PDF integer".
-- Read PDF pages whose text is wrapped in marked content or preceded by graphics-state
-  operators: skip `BMC`/`BDC`/`EMC` and the graphics-state/colour operators that do not emit
-  glyphs, instead of failing the page. WPS and Chrome exports now reach the font layer rather
-  than an operator error; forms, inline images, shading and embedded fonts remain unsupported.
 - 切换离开已接入预设时撤回 PTC 发布并取消调用；保留其他会话的发现选择，外部调用仅在自有包装内授权一次。
 - 诊断所选发现/Shell 的服务与作用域发布，并说明无关预设嵌套时宿主继承祖先注册/限制的边界。
 - Plan only the new Agent on `agent/created` instead of re-reading every live session's tool
@@ -297,11 +315,7 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   was the visible lag when starting one with many sessions open.
 - 新建会话时只规划新 Agent，不再重读所有存活会话的工具视图；`tools/change` 只核对它实际触达的
   Agent，宿主未标注归属的变更合并为一次处理。新建会话不再随已开会话数线性扫描工具视图。
-- 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
-  带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败。
-- 读取文本被标记内容包裹、或前置图形状态操作符的 PDF 页面：跳过 `BMC`/`BDC`/`EMC` 以及不产生
-  字形的图形状态/颜色操作符，不再整页失败。WPS 与 Chrome 导出的文件现在会进入字体层而非报操作符
-  错误；表单、内联图片、渐变与嵌入字体仍不支持。
+
 
 ## [0.5.0] — 2026-10-27 — Preset-mode component roster
 
@@ -340,10 +354,13 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Embed the complete frozen official Niubash v1.5.0 Windows x64 payload as the default shell backend; verify source and per-call execution trees, include preparation in cancellation/deadlines, preserve results on cleanup failure, and integrate managed install/status/select/removal. Missing payloads never switch implicitly to ambient Bash; explicit Git Bash and POSIX system Bash remain supported. This full-package-first choice does not rule out rubash-only later.
 - Windows x64 默认 Shell 改为固定官方 Niubash v1.5.0 完整载荷；校验源树及每调用执行树，准备阶段纳入取消/超时，清理失败不覆盖结果，并接通托管安装/状态/选择/卸载。缺载荷不隐式切换环境 Bash，保留显式 Git Bash 与 POSIX 系统 Bash。这是先完整包的阶段选择，不否定后续 rubash-only。
 
-- Let `/Prev` and `/XRefStm` be ordinary PDF dictionary keys: they mark an unsupported
-  incremental update only as trailer keys, so an outline item's `/Prev` no longer makes the
-  whole document unreadable (#427).
-- 允许 `/Prev` 与 `/XRefStm` 作为普通 PDF 字典键：仅当它们出现在 trailer 中才表示不支持的增量更新，大纲项里的 `/Prev` 不再使整份文档被判不可读（#427）。
+- Let `/Prev` and `/XRefStm` be ordinary PDF dictionary keys: they mark an incremental
+  update only as trailer keys, so an outline item's `/Prev` no longer makes the whole
+  document unreadable (#427). The container follows that trailer `/Prev` chain and reads
+  incremental PDFs instead of refusing them.
+- 允许 `/Prev` 与 `/XRefStm` 作为普通 PDF 字典键：仅当它们出现在 trailer 中才表示增量更新，
+  大纲项里的 `/Prev` 不再使整份文档被判不可读（#427）。容器现在沿 trailer 的 `/Prev` 链读取
+  增量 PDF，而不是拒绝它们。
 
 - Add current-scope `ops_status` diagnostics and public `diagnose(ctx, agent)` inspection; report integration, host/runtime, presentation and external provider readiness without executing or activating capabilities (#440).
 - 新增当前作用域 `ops_status` 与公开 `diagnose(ctx, agent)`，区分接入、宿主/运行时、展示及外部提供者状态，不执行或激活能力（#440）。

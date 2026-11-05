@@ -57,9 +57,17 @@ await test('unsupported later operators keep preceding complete pages without in
 })
 await test('unsupported fonts mappings controls and older encoding semantics fail explicitly', async () => {
   await withTempDir('pdf-fonts', async root => {
-    for (const options of [{ font: 'Symbol' }, { font: 'Arial' }, { encoding: 'MacRomanEncoding' }, { fontExtra: '/ToUnicode 3 0 R' }, { fontExtra: '/FontDescriptor 3 0 R' }, { version: '1.2' }]) {
+    // A named encoding outside WinAnsi, a built-in encoding outside the standard Latin
+    // families, and PDF 1.2 semantics stay unsupported.
+    for (const options of [{ encoding: 'MacRomanEncoding' }, { font: 'Symbol', encoding: null }, { font: 'Arial', encoding: null }, { version: '1.2' }]) {
       failure(await run(root, { path: fileAt(root, textPdf([show('text')], options)) }), 'UNSUPPORTED_DOCUMENT')
     }
+    // A /ToUnicode entry that names no stream is malformed, not merely unsupported.
+    failure(await run(root, { path: fileAt(root, textPdf([show('text')], { fontExtra: '/ToUnicode 3 0 R' })) }), 'DOCUMENT_PARSE_ERROR')
+    // /WinAnsiEncoding carries the mapping, so an embedded simple font outside the standard
+    // families decodes without a ToUnicode CMap (byte 0x80 is the WinAnsi euro sign).
+    const winansi = await run(root, { path: fileAt(root, textPdf([show(Buffer.from([0x41, 0x80]))], { font: 'Arial', fontExtra: '/FontDescriptor 3 0 R' })) })
+    assert.equal(winansi.items[0].text, 'A€')
     failure(await run(root, { path: fileAt(root, textPdf([show(Buffer.from([0xe9]))], { encoding: null })) }), 'UNSUPPORTED_DOCUMENT')
     failure(await run(root, { path: fileAt(root, textPdf([show(Buffer.from([0,10]))])) }), 'UNSUPPORTED_DOCUMENT')
   })

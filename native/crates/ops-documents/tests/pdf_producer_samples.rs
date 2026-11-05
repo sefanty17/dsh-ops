@@ -1,22 +1,18 @@
 //! Producer-export fixtures: Chrome print-to-PDF, Word 2021 and WPS Writer.
 //!
-//! Chrome and WPS place graphics-state and marked-content operators where the
-//! classic operator whitelist refused them: Chrome failed with
-//! `Unsupported PDF content operator gs` and WPS with `Non-text PDF operator
-//! inside a text object`. Once the operator whitelist accepts those operators,
-//! both exports reach the font layer instead, where the embedded Type0 fonts are
-//! still unsupported: the scan reports `status: "partial"`, an error that names
-//! fonts, and no page text. These two assertions are therefore red on the
-//! pre-extension reader and green after the extension; they are the signal that
-//! the operator gap moved down to fonts.
+//! All three exports read end to end now. Chrome and WPS embed Type0 Identity-H
+//! fonts whose `ToUnicode` CMaps carry the Unicode text, and they show a few
+//! codes per `Tj`, so a line arrives as many runs. Word adds two simple TrueType
+//! subsets that declare `/WinAnsiEncoding` and no `ToUnicode`, which the reader
+//! decodes from the named encoding, next to two Type0 Identity fonts like the
+//! other producers. These tests pin the decoded text: a regression in the
+//! operator whitelist, the font layer or the container turns the text empty,
+//! partial or garbled rather than silently passing.
 //!
 //! The Word 2021 export is a hybrid-reference document with an incremental
 //! update: its final classic xref table is an empty `0 0` subsection, and the
 //! trailer's `/Prev` (previous classic xref) and `/XRefStm` (xref stream) hold the
-//! real object entries. The container rejects that empty incremental subsection
-//! today, so the Word pin is green now and goes red once the container accepts the
-//! document; it pins the rejected empty incremental subsection, not xref-stream
-//! detection.
+//! real object entries, one of which is a `/Type /ObjStm` container.
 //!
 //! The final test guards the fixture bytes themselves, so a replaced sample can
 //! never silently change what the reader assertions mean.
@@ -58,93 +54,78 @@ fn read_pdf(name: &str) -> Result<Value, Failure> {
     ops_documents::dispatch(&request)
 }
 
-fn message(output: &Value) -> &str {
-    output["error"]["message"].as_str().unwrap_or("")
-}
-
-/// The export got past every content operator and stopped at the font layer.
+/// The single page's text with the run separators removed.
 ///
-/// `pre_extension` is the operator error this fixture produced before the
-/// whitelist covered its graphics-state/marked-content operators; naming it keeps
-/// a regression that re-rejects those operators self-explanatory.
-///
-/// The named font error and the empty page text are current-stage pins: they hold
-/// while Type0 fonts are unsupported. When embedded fonts become readable the scan
-/// may complete with text, so the empty-text assertion below must be relaxed then;
-/// the status check already accepts `completed`.
-fn assert_reaches_the_font_layer(name: &str, pre_extension: &str, output: &Value) {
-    let status = output["status"].as_str().unwrap_or("");
-    assert!(
-        status == "partial" || status == "completed",
-        "{name}: expected a partial or completed scan once the operator whitelist covers this \
-         export, got status {status:?}: {output}"
-    );
-    let message = message(output);
-    assert!(
-        !message.contains("operator"),
-        "{name}: the reader still fails on a non-text operator ({message:?}), which is exactly the \
-         {pre_extension:?} failure the operator extension is meant to remove: {output}"
-    );
-    if status == "partial" {
-        assert!(
-            message.contains("font"),
-            "{name}: a partial scan must stop at the font layer (embedded Type0 fonts); got \
-             {message:?}: {output}"
-        );
-    }
-    // Current-stage pin, not an endorsement: Type0 fonts are unsupported, so the
-    // scan must not report page text it cannot decode. A completed scan with text
-    // is the expected shape once embedded fonts are readable; relax this then.
+/// Chrome and WPS show a few codes per `Tj`, so the reader reports many runs per
+/// line; joining them is the only way to compare the produced text with the
+/// document's words.
+fn page_text(name: &str, output: &Value) -> String {
     let items = output["items"]
         .as_array()
         .unwrap_or_else(|| panic!("{name}: items must be an array: {output}"));
-    for item in items {
-        let text = item["text"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{name}: item text must be a string: {output}"));
+    assert_eq!(items.len(), 1, "{name}: one page expected: {output}");
+    items[0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name}: item text must be a string: {output}"))
+        .replace('\n', "")
+}
+
+/// The export completed and its text contains every `expected` fragment.
+fn assert_reads(name: &str, output: &Value, expected: &[&str]) {
+    assert_eq!(
+        output["status"], "completed",
+        "{name}: the export must read completely once its fonts decode: {output}"
+    );
+    assert!(
+        output.get("error").is_none(),
+        "{name}: a completed scan must not report a failure: {output}"
+    );
+    let text = page_text(name, output);
+    for fragment in expected {
         assert!(
-            text.is_empty(),
-            "{name}: no page text is decodable while Type0 fonts are unsupported; got {text:?}: {output}"
+            text.contains(fragment),
+            "{name}: expected {fragment:?} in the decoded text, got {text:?}"
         );
     }
 }
 
 #[test]
-fn chrome_print_export_reaches_the_font_layer() {
+fn chrome_print_export_decodes_its_type0_fonts() {
     let output = read_pdf(CHROME).expect("Chrome print export must still parse its classic xref");
-    assert_reaches_the_font_layer(CHROME, "Unsupported PDF content operator gs", &output);
+    // Type0 Identity-H fonts with a ToUnicode CMap, shown a few codes per `Tj`.
+    assert_reads(CHROME, &output, &["中文测试", "Q3 Report", "Gross margin 37.4"]);
 }
 
 #[test]
-fn wps_export_reaches_the_font_layer() {
+fn wps_export_decodes_its_type0_fonts() {
     let output = read_pdf(WPS).expect("WPS export must still parse its classic xref");
-    assert_reaches_the_font_layer(WPS, "Non-text PDF operator inside a text object", &output);
+    // WPS positions words instead of showing space glyphs, so the joined text has no
+    // spaces and the assertions stay on fragments that survive the run join.
+    assert_reads(WPS, &output, &["中文测试", "季度报告与毛利率", "37.4%"]);
 }
 
 /// The Word 2021 export is a hybrid-reference PDF with an incremental update.
 ///
-/// `startxref` points at a classic xref table whose only subsection is the empty
-/// `0 0`; the trailer's `/Prev 136746` (previous classic xref) and `/XRefStm
-/// 136356` (xref stream) hold the actual object entries. The container refuses
-/// that empty incremental subsection today, so this test pins "empty incremental
-/// subsection rejected", not "xref stream rejected". It goes red as soon as the
-/// container accepts the document, which is when the pin must become a reading
-/// assertion for the produced text.
+/// `startxref` points at a classic xref table whose only subsection is the empty `0 0`; the
+/// trailer's `/Prev 136746` (previous classic xref) and `/XRefStm 136356` (xref stream) hold the
+/// actual entries, and object 29 is a `/Type /ObjStm` container for objects 21..=54.
+///
+/// Its four fonts decode through both supported simple paths: `/F1` and `/F2` are TrueType
+/// subsets with `/WinAnsiEncoding` and no `ToUnicode`, while `/F3` and `/F4` are Type0 Identity
+/// fonts with a `ToUnicode` CMap. The English runs therefore prove the named-encoding path and
+/// the Chinese runs prove the CMap path in one document.
 #[test]
-fn word2021_export_pins_the_empty_incremental_xref_subsection() {
-    let error = read_pdf(WORD).expect_err(
-        "the Word 2021 export now parses: the container accepts the hybrid-reference incremental \
-         update, so this pin must be replaced with the reading assertion for the produced text",
-    );
+fn word2021_export_parses_and_decodes_both_simple_font_paths() {
+    let bytes = raw(WORD);
+    let document = ops_documents::pdf_container::parse(&bytes)
+        .expect("the Word 2021 hybrid-reference incremental PDF must parse");
     assert_eq!(
-        error.code, "DOCUMENT_PARSE_ERROR",
-        "the Word 2021 export must keep failing at the container layer: {error:?}"
+        document.objects.len(),
+        68,
+        "every active object must load, including the objects expanded from the /Type /ObjStm"
     );
-    assert!(
-        error.message.contains("subsection"),
-        "the container failure must name the empty incremental xref subsection it rejects, got {:?}",
-        error.message
-    );
+    let output = read_pdf(WORD).expect("the reader reports a status instead of failing");
+    assert_reads(WORD, &output, &["Q3 Report", "Gross margin 37.4", "中文测试"]);
 }
 
 /// True when `haystack` contains `needle`; PDF dictionary keys may be written
@@ -195,7 +176,7 @@ fn fixtures_keep_the_producer_container_structure() {
     );
     assert!(
         contains_type(&word, "ObjStm") || contains_type(&word, "XRef"),
-        "Word 2021 export must keep its object stream or xref stream; without either it is no \
-         longer the fixture that pins the container gap"
+        "Word 2021 export must keep its object stream or xref stream; without either it no longer \
+         exercises the hybrid-reference container"
     );
 }
