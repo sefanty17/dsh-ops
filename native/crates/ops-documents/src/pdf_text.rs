@@ -111,11 +111,46 @@ fn numbers(args: &[Value], count: usize) -> Result<()> {
 fn no_args(args: &[Value]) -> Result<()> {
     numbers(args, 0)
 }
+fn named(args: &[Value], count: usize) -> Result<()> {
+    if args.len() != count || !args.iter().all(|arg| matches!(arg, Value::Name(_))) {
+        return Err(bad("Invalid PDF name operator arguments"));
+    }
+    Ok(())
+}
 fn string(value: &Value, encoding: Encoding) -> Result<String> {
     match value {
         Value::String(bytes) => text(bytes, encoding),
         _ => Err(bad("PDF text-showing operand is not a string")),
     }
+}
+// Operators tolerated inside a text object although they are not text operators. Each sets
+// graphics state or a colour space, or opens, closes or marks a marked-content sequence: none
+// emits a glyph, moves the text position or reorders runs, so skipping them cannot change the
+// extracted text. ISO 32000-1 section 9.4 allows only text operators between BT and ET, but WPS
+// exports put `rg` and `gs` there. Operators that paint content (Do, inline images, path fills)
+// stay rejected.
+fn tolerated_in_text(op: &[u8]) -> bool {
+    matches!(
+        op,
+        b"gs"
+            | b"g"
+            | b"G"
+            | b"rg"
+            | b"RG"
+            | b"k"
+            | b"K"
+            | b"sc"
+            | b"scn"
+            | b"SC"
+            | b"SCN"
+            | b"cs"
+            | b"CS"
+            | b"BMC"
+            | b"BDC"
+            | b"EMC"
+            | b"MP"
+            | b"DP"
+    )
 }
 pub fn extract(
     doc: &Document<'_>,
@@ -170,6 +205,7 @@ pub fn extract(
                     | b"Tr"
                     | b"BT"
             )
+            && !tolerated_in_text(op)
         {
             return Err(bad("Non-text PDF operator inside a text object"));
         }
@@ -293,9 +329,59 @@ pub fn extract(
                 }
                 args[0].name()?;
             }
+            // Skipped without semantics: they either change graphics state or label content,
+            // and none of them produces glyphs or reorders the text runs.
+            b"gs" => named(&args, 1)?,
+            b"cs" | b"CS" => {
+                // The colour space is named here; its components arrive later and paint
+                // nothing at this operator.
+                if args.len() != 1 || !matches!(args[0], Value::Name(_)) {
+                    return Err(bad("Invalid PDF colour space arguments"));
+                }
+            }
+            b"BMC" => named(&args, 1)?,
+            b"BDC" => {
+                // The property list may be a name, an inline dictionary or an indirect reference;
+                // it labels the content and is never traversed.
+                if args.len() != 2
+                    || !matches!(args[0], Value::Name(_))
+                    || !matches!(args[1], Value::Name(_) | Value::Dict(_) | Value::Ref(..))
+                {
+                    return Err(bad("Invalid PDF marked-content BDC arguments"));
+                }
+            }
+            b"EMC" => no_args(&args)?,
+            b"MP" => {
+                if args.len() != 1 || !matches!(args[0], Value::Name(_)) {
+                    return Err(bad("Invalid PDF marked-content MP arguments"));
+                }
+            }
+            b"DP" => {
+                // The property list is optional here, and may be a name, an inline dictionary or
+                // an indirect reference; it labels a point and is never traversed.
+                if args.is_empty()
+                    || args.len() > 2
+                    || !matches!(args[0], Value::Name(_))
+                    || (args.len() == 2
+                        && !matches!(args[1], Value::Name(_) | Value::Dict(_) | Value::Ref(..)))
+                {
+                    return Err(bad("Invalid PDF marked-content DP arguments"));
+                }
+            }
+            b"sc" | b"scn" | b"SC" | b"SCN" => {
+                // A name operand selects a pattern colour, whose paint is not traversed.
+                if args.iter().any(|arg| matches!(arg, Value::Name(_))) {
+                    return Err(unsupported(
+                        "PDF pattern colours are unsupported; pattern content is not traversed",
+                    ));
+                }
+                if args.is_empty() || args.len() > 4 || !args.iter().all(numeric) {
+                    return Err(bad("Invalid PDF colour component arguments"));
+                }
+            }
             _ => {
                 return Err(unsupported(format!(
-                    "Unsupported PDF content operator {}; forms, images, marked content and external graphics state are not traversed",
+                    "Unsupported PDF content operator {}; forms, images and shading are not traversed",
                     String::from_utf8_lossy(op)
                 )));
             }
@@ -318,4 +404,161 @@ pub fn extract(
         ));
     }
     Ok(runs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pdf_container::parse;
+    /// One page whose `/Resources` aliases Helvetica as `/F1` and `/FT8`; content is per test.
+    fn document_bytes() -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R /FT8 4 0 R >> >> >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ];
+        let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        let mut offsets = vec![0];
+        for (index, value) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{value}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes());
+        for offset in offsets.iter().skip(1) {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                offsets.len()
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+    fn extract_text(content: &[u8]) -> Result<Vec<String>> {
+        let bytes = document_bytes();
+        let document = parse(&bytes).unwrap();
+        let page = document.object((3, 0)).unwrap().value.dict().unwrap();
+        extract(
+            &document,
+            page.get(b"Resources".as_slice()),
+            content,
+            Instant::now(),
+        )
+    }
+    #[test]
+    fn graphics_state_and_colour_inside_a_text_object_keep_the_text() {
+        // A WPS export: `rg` and `gs` appear between BT and ET, before the glyphs.
+        let runs = extract_text(
+            b"q BT 0.212 0.376 0.569 rg /FT8 281 Tf /GS13 gs 0.05 0 0 -0.05 90 109.37 Tm <59>Tj ET Q",
+        )
+        .unwrap();
+        assert_eq!(runs, ["Y"]);
+    }
+    #[test]
+    fn graphics_state_and_marked_content_outside_a_text_object_are_skipped() {
+        // A Chrome (Skia) export: an external graphics state, then marked content around the text.
+        let runs =
+            extract_text(b"q /G3 gs /NonStruct << /MCID 0 >> BDC BT /F1 12 Tf (Hi) Tj ET EMC Q")
+                .unwrap();
+        assert_eq!(runs, ["Hi"]);
+        let runs = extract_text(
+            b"/Artifact BMC 0.1 w 0.5 G 0.5 0.25 0.25 rg /Span <</MCID 1>> BDC BT /F1 12 Tf (ok) Tj ET EMC EMC",
+        )
+        .unwrap();
+        assert_eq!(runs, ["ok"]);
+    }
+    #[test]
+    fn marked_content_inside_a_text_object_does_not_change_the_runs() {
+        let runs = extract_text(b"BT /F1 12 Tf /Span <</MCID 0>> BDC (A) Tj EMC (B) Tj ET")
+            .unwrap();
+        assert_eq!(runs, ["A", "B"]);
+    }
+    #[test]
+    fn colour_spaces_and_marked_content_points_keep_the_text() {
+        // Selecting a colour space and marking a point emit no glyph, so both are skipped
+        // whether they appear before the text object or inside it.
+        for content in [
+            b"/DeviceRGB cs /DeviceGray CS BT /F1 12 Tf (A) Tj ET".as_slice(),
+            b"BT /DeviceRGB cs /F1 12 Tf (A) Tj /DeviceGray CS ET",
+        ] {
+            assert_eq!(extract_text(content).unwrap(), ["A"]);
+        }
+        for content in [
+            b"/P MP /Span << /MCID 0 >> DP BT /F1 12 Tf (B) Tj ET".as_slice(),
+            b"BT /P MP /F1 12 Tf (B) Tj /Span 9 0 R DP ET",
+        ] {
+            assert_eq!(extract_text(content).unwrap(), ["B"]);
+        }
+    }
+    #[test]
+    fn colour_space_and_marked_content_point_operands_are_validated() {
+        for content in [
+            b"BT /F1 12 Tf (A) Tj ET cs".as_slice(),
+            b"BT /F1 12 Tf (A) Tj ET 0 cs",
+            b"BT /F1 12 Tf (A) Tj ET /A /B cs",
+            b"BT /F1 12 Tf (A) Tj ET 0 CS",
+            b"BT /F1 12 Tf (A) Tj 0 cs ET",
+            b"BT /F1 12 Tf (A) Tj ET MP",
+            b"BT /F1 12 Tf (A) Tj ET /A /B MP",
+            b"BT /F1 12 Tf (A) Tj ET DP",
+            b"BT /F1 12 Tf (A) Tj ET 1 DP",
+            b"BT /F1 12 Tf (A) Tj ET /A /B /C DP",
+            b"BT /F1 12 Tf (A) Tj ET /A 5 DP",
+            b"BT /F1 12 Tf (A) Tj MP ET",
+        ] {
+            let error = extract_text(content).expect_err(std::str::from_utf8(content).unwrap());
+            assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+        }
+    }
+    #[test]
+    fn unknown_and_painting_operators_remain_unsupported_outside_text() {
+        for content in [
+            b"BT /F1 12 Tf (A) Tj ET QX".as_slice(),
+            b"BT /F1 12 Tf (A) Tj ET /Im1 Do",
+            b"BT /F1 12 Tf (A) Tj ET BI /W 1 /H 1 ID x EI",
+            b"BT /F1 12 Tf (A) Tj ET /Sh1 sh",
+        ] {
+            let error = extract_text(content).unwrap_err();
+            assert_eq!(error.code, "UNSUPPORTED_DOCUMENT", "{}", error.message);
+        }
+    }
+    #[test]
+    fn painting_operators_inside_a_text_object_are_still_rejected() {
+        for content in [
+            b"BT /F1 12 Tf (A) Tj /Im1 Do ET".as_slice(),
+            b"BT /F1 12 Tf (A) Tj BI /W 1 /H 1 ID x EI ET",
+            b"BT /F1 12 Tf (A) Tj 0 0 m 1 1 l S ET",
+        ] {
+            let error = extract_text(content).unwrap_err();
+            assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+            assert!(
+                error
+                    .message
+                    .contains("Non-text PDF operator inside a text object"),
+                "{}",
+                error.message
+            );
+        }
+    }
+    #[test]
+    fn skipped_operators_still_validate_their_operands() {
+        for content in [
+            b"BT /F1 12 Tf (A) Tj ET gs".as_slice(),
+            b"BT /F1 12 Tf (A) Tj ET 0 0 gs",
+            b"BT /F1 12 Tf (A) Tj ET /A /B BMC",
+            b"BT /F1 12 Tf (A) Tj ET /Span BDC",
+            b"BT /F1 12 Tf (A) Tj ET /Tag EMC",
+            b"BT /F1 12 Tf (A) Tj ET 1 2 3 4 rg",
+            b"BT /F1 12 Tf (A) Tj ET 1 2 3 4 5 scn",
+        ] {
+            let error = extract_text(content).expect_err(std::str::from_utf8(content).unwrap());
+            assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+        }
+        let pattern = extract_text(b"BT /F1 12 Tf (A) Tj ET /P1 scn").unwrap_err();
+        assert_eq!(pattern.code, "UNSUPPORTED_DOCUMENT", "{}", pattern.message);
+    }
 }

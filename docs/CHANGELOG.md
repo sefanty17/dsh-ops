@@ -161,6 +161,18 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   instead of failing with "Expected a bounded nonnegative PDF integer" (#646).
 - 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
   带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败（#646）。
+- Read PDF pages whose text is wrapped in marked content or preceded by graphics-state
+  operators: skip the listed graphics-state and colour operators (`gs`, `g`/`G`, `rg`/`RG`,
+  `k`/`K`, `sc`/`scn`/`SC`/`SCN`, `cs`/`CS`) and the marked-content operators
+  (`BMC`/`BDC`/`EMC`, `MP`/`DP`), none of which emits a glyph, instead of failing the page.
+  WPS and Firefox exports now reach the font layer rather than an operator error; forms, inline
+  images and shading remain unsupported. The bilingual PDF worker docs list the same operator
+  set (#646).
+- 读取文本被标记内容包裹、或前置图形状态操作符的 PDF 页面：跳过下列不产生字形的图形状态与颜色
+  操作符（`gs`、`g`/`G`、`rg`/`RG`、`k`/`K`、`sc`/`scn`/`SC`/`SCN`、`cs`/`CS`）以及标记内容
+  操作符（`BMC`/`BDC`/`EMC`、`MP`/`DP`），不再整页失败。WPS 与 Firefox 导出的文件现在会进入
+  字体层而非报操作符错误；表单、内联图片与渐变仍不支持。中英文 PDF worker 文档同步列出这组
+  操作符（#646）。
 
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 

@@ -475,10 +475,10 @@ fn has_indirect_length(bytes: &[u8]) -> bool {
 ///
 /// The fixture is a real `soffice --convert-to pdf` output: PDF 1.7, the UTF-8
 /// `%äüöß` second line, and two indirect `/Length` references. It pins two facts:
-/// the container now parses such a file (the #646 fix), and text extraction still
-/// stops at the marked-content operators LibreOffice wraps its text in. The second
-/// assertion is deliberately a pin, not an endorsement: when marked content becomes
-/// traversable this test must change with it.
+/// the container now parses such a file (the #646 fix), and text extraction gets
+/// through the content layer (marked content and external graphics state) but still
+/// stops at the embedded font. The second assertion is deliberately a pin, not an
+/// endorsement: when embedded fonts become supported this test must change with it.
 #[test]
 fn libreoffice_export_parses_and_pins_the_next_content_gap() {
     let fixture = concat!(
@@ -510,7 +510,8 @@ fn libreoffice_export_parses_and_pins_the_next_content_gap() {
         document.objects.len()
     );
 
-    // Remaining gap: the text layer uses marked content, which this reader declines.
+    // Remaining gap: the text layer uses an embedded TrueType subset, which this reader
+    // declines. Marked content (BMC/BDC/EMC) and `gs` no longer stop the scan.
     let output = read_pdf(&bytes).expect("the reader reports a status instead of failing");
     assert_eq!(output["status"], "partial", "reader reported {output}");
     assert_eq!(
@@ -521,7 +522,7 @@ fn libreoffice_export_parses_and_pins_the_next_content_gap() {
         output["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("BMC"),
-        "the pinned gap is marked content: {output}"
+            .contains("font"),
+        "the pinned gap is the embedded font: {output}"
     );
 }
