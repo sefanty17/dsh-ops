@@ -1,8 +1,8 @@
 //! Bounded page-tree traversal and one-time stream decompression; repeated content is charged again as work.
 use crate::{
     pdf_container::{Document, MAX_STREAM, ObjectId, decode, get},
+    pdf_limits::{MAX_CONTENT_DECODED, deadline},
     pdf_syntax::{Dict, Value, bad, limit},
-    pdf_text::deadline,
 };
 use ops_protocol::Result;
 use std::{
@@ -10,7 +10,6 @@ use std::{
     time::Instant,
 };
 pub const MAX_PAGES: usize = 32;
-pub const MAX_DECODED: usize = 16 * 1024 * 1024;
 pub struct Page<'a> {
     pub dict: &'a Dict,
     pub resources: Option<&'a Value>,
@@ -155,14 +154,14 @@ impl Streams {
         if !self.cache.contains_key(&id) {
             let bytes = decode(doc.object(id)?)?;
             deadline(started)?;
-            if self.decoded + bytes.len() > MAX_DECODED {
+            if self.decoded + bytes.len() > MAX_CONTENT_DECODED {
                 return Err(limit("PDF aggregate decoded streams exceed 16 MiB"));
             }
             self.decoded += bytes.len();
             self.cache.insert(id, bytes);
         }
         let bytes = &self.cache[&id];
-        if self.processed + bytes.len() > MAX_DECODED || output.len() + bytes.len() > MAX_STREAM {
+        if self.processed + bytes.len() > MAX_CONTENT_DECODED || output.len() + bytes.len() > MAX_STREAM {
             return Err(limit(
                 "PDF processed content exceeds 16 MiB total or 1 MiB per page",
             ));

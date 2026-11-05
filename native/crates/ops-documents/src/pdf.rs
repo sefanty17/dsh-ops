@@ -173,7 +173,7 @@ mod tests {
     fn expired_pdf_deadline_is_an_explicit_failure() {
         let expired = Instant::now() - std::time::Duration::from_secs(30);
         assert_eq!(
-            pdf_text::deadline(expired).unwrap_err().code,
+            crate::pdf_limits::deadline(expired).unwrap_err().code,
             "DEADLINE_EXCEEDED"
         );
     }

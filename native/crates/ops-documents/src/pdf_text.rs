@@ -2,27 +2,13 @@
 use crate::{
     pdf_container::{Document, ObjectId, get},
     pdf_font::FontDecoder,
-    pdf_limits::MAX_TEXT,
-    pdf_pages::MAX_DECODED,
+    pdf_limits::{MAX_CONTENT_DECODED, MAX_TEXT, deadline},
     pdf_syntax::{Lexer, Value, bad, limit, unsupported},
 };
-use ops_protocol::{Failure, Result};
-use std::{
-    collections::BTreeMap,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use ops_protocol::Result;
+use std::{collections::BTreeMap, rc::Rc, time::Instant};
 /// Fonts whose character-code tables one document may decode.
 pub const MAX_FONTS: usize = 64;
-pub fn deadline(started: Instant) -> Result<()> {
-    if started.elapsed() >= Duration::from_secs(30) {
-        return Err(Failure::new(
-            "DEADLINE_EXCEEDED",
-            "PDF reading reached its 30-second deadline",
-        ));
-    }
-    Ok(())
-}
 /// The character-code decoder one `Tf` selected, built on the first operator that shows text.
 #[derive(Clone)]
 enum Selection {
@@ -68,7 +54,7 @@ impl Fonts {
         }
         let decoder = Rc::new(FontDecoder::from_value(doc, value)?);
         let size = decoder.decoded_bytes();
-        if *decoded + size > MAX_DECODED {
+        if *decoded + size > MAX_CONTENT_DECODED {
             return Err(limit("PDF aggregate decoded streams exceed 16 MiB"));
         }
         *decoded += size;
@@ -549,7 +535,7 @@ mod tests {
             "<< /F1 4 0 R >>",
             &objects,
             content,
-            MAX_DECODED - CMAP_BODY.len() + 1,
+            MAX_CONTENT_DECODED - CMAP_BODY.len() + 1,
         )
         .unwrap_err();
         assert_eq!(error.code, "OUTPUT_LIMIT", "{}", error.message);
@@ -559,11 +545,11 @@ mod tests {
             "<< /F1 4 0 R >>",
             &objects,
             content,
-            MAX_DECODED - CMAP_BODY.len(),
+            MAX_CONTENT_DECODED - CMAP_BODY.len(),
         )
         .unwrap();
         assert_eq!(runs, ["Q3"]);
-        assert_eq!(decoded, MAX_DECODED);
+        assert_eq!(decoded, MAX_CONTENT_DECODED);
     }
     #[test]
     fn more_than_64_selected_fonts_exceed_the_font_budget() {
@@ -599,7 +585,7 @@ mod tests {
     }
     #[test]
     fn graphics_state_and_marked_content_outside_a_text_object_are_skipped() {
-        // A Chrome (Skia) export: an external graphics state, then marked content around the text.
+        // A browser print (Skia) export: an external graphics state, then marked content.
         let runs =
             extract_text(b"q /G3 gs /NonStruct << /MCID 0 >> BDC BT /F1 12 Tf (Hi) Tj ET EMC Q")
                 .unwrap();
