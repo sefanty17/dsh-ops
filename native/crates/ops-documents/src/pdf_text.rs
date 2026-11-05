@@ -143,11 +143,12 @@ fn selected_decoder(
         }
     }
 }
-// Operators tolerated inside a text object although they are not text operators. Each changes
-// graphics state or opens/closes a marked-content sequence: none emits a glyph, moves the text
-// position or reorders runs, so skipping them cannot change the extracted text. ISO 32000-1
-// section 9.4 allows only text operators between BT and ET, but WPS exports put `rg` and `gs`
-// there. Operators that paint content (Do, inline images, path fills) stay rejected.
+// Operators tolerated inside a text object although they are not text operators. Each sets
+// graphics state or a colour space, or opens, closes or marks a marked-content sequence: none
+// emits a glyph, moves the text position or reorders runs, so skipping them cannot change the
+// extracted text. ISO 32000-1 section 9.4 allows only text operators between BT and ET, but WPS
+// exports put `rg` and `gs` there. Operators that paint content (Do, inline images, path fills)
+// stay rejected.
 fn tolerated_in_text(op: &[u8]) -> bool {
     matches!(
         op,
@@ -162,9 +163,13 @@ fn tolerated_in_text(op: &[u8]) -> bool {
             | b"scn"
             | b"SC"
             | b"SCN"
+            | b"cs"
+            | b"CS"
             | b"BMC"
             | b"BDC"
             | b"EMC"
+            | b"MP"
+            | b"DP"
     )
 }
 /// Extract the text runs of one page content stream in content order.
@@ -355,6 +360,13 @@ pub fn extract(
             // Skipped without semantics: they either change graphics state or label content,
             // and none of them produces glyphs or reorders the text runs.
             b"gs" => named(&args, 1)?,
+            b"cs" | b"CS" => {
+                // The colour space is named here; its components arrive later and paint
+                // nothing at this operator.
+                if args.len() != 1 || !matches!(args[0], Value::Name(_)) {
+                    return Err(bad("Invalid PDF colour space arguments"));
+                }
+            }
             b"BMC" => named(&args, 1)?,
             b"BDC" => {
                 // The property list may be a name, an inline dictionary or an indirect reference;
@@ -367,6 +379,23 @@ pub fn extract(
                 }
             }
             b"EMC" => no_args(&args)?,
+            b"MP" => {
+                if args.len() != 1 || !matches!(args[0], Value::Name(_)) {
+                    return Err(bad("Invalid PDF marked-content MP arguments"));
+                }
+            }
+            b"DP" => {
+                // The property list is optional here, and may be a name, an inline dictionary or
+                // an indirect reference; it labels a point and is never traversed.
+                if args.is_empty()
+                    || args.len() > 2
+                    || !matches!(args[0], Value::Name(_))
+                    || (args.len() == 2
+                        && !matches!(args[1], Value::Name(_) | Value::Dict(_) | Value::Ref(..)))
+                {
+                    return Err(bad("Invalid PDF marked-content DP arguments"));
+                }
+            }
             b"sc" | b"scn" | b"SC" | b"SCN" => {
                 // A name operand selects a pattern colour, whose paint is not traversed.
                 if args.iter().any(|arg| matches!(arg, Value::Name(_))) {
@@ -575,6 +604,43 @@ mod tests {
         let runs = extract_text(b"BT /F1 12 Tf /Span <</MCID 0>> BDC (A) Tj EMC (B) Tj ET")
             .unwrap();
         assert_eq!(runs, ["A", "B"]);
+    }
+    #[test]
+    fn colour_spaces_and_marked_content_points_keep_the_text() {
+        // Selecting a colour space and marking a point emit no glyph, so both are skipped
+        // whether they appear before the text object or inside it.
+        for content in [
+            b"/DeviceRGB cs /DeviceGray CS BT /F1 12 Tf (A) Tj ET".as_slice(),
+            b"BT /DeviceRGB cs /F1 12 Tf (A) Tj /DeviceGray CS ET",
+        ] {
+            assert_eq!(extract_text(content).unwrap(), ["A"]);
+        }
+        for content in [
+            b"/P MP /Span << /MCID 0 >> DP BT /F1 12 Tf (B) Tj ET".as_slice(),
+            b"BT /P MP /F1 12 Tf (B) Tj /Span 9 0 R DP ET",
+        ] {
+            assert_eq!(extract_text(content).unwrap(), ["B"]);
+        }
+    }
+    #[test]
+    fn colour_space_and_marked_content_point_operands_are_validated() {
+        for content in [
+            b"BT /F1 12 Tf (A) Tj ET cs".as_slice(),
+            b"BT /F1 12 Tf (A) Tj ET 0 cs",
+            b"BT /F1 12 Tf (A) Tj ET /A /B cs",
+            b"BT /F1 12 Tf (A) Tj ET 0 CS",
+            b"BT /F1 12 Tf (A) Tj 0 cs ET",
+            b"BT /F1 12 Tf (A) Tj ET MP",
+            b"BT /F1 12 Tf (A) Tj ET /A /B MP",
+            b"BT /F1 12 Tf (A) Tj ET DP",
+            b"BT /F1 12 Tf (A) Tj ET 1 DP",
+            b"BT /F1 12 Tf (A) Tj ET /A /B /C DP",
+            b"BT /F1 12 Tf (A) Tj ET /A 5 DP",
+            b"BT /F1 12 Tf (A) Tj MP ET",
+        ] {
+            let error = extract_text(content).expect_err(std::str::from_utf8(content).unwrap());
+            assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+        }
     }
     #[test]
     fn unknown_and_painting_operators_remain_unsupported_outside_text() {
