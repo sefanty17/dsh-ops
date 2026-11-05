@@ -21,6 +21,24 @@ fn reference(value: &Value) -> Result<ObjectId> {
         _ => Err(bad("PDF page/content identity must be indirect")),
     }
 }
+/// Resolve the page-tree `/Count` and read it as a bounded nonnegative integer.
+///
+/// `/Count` is an integer value, and PDF lets any dictionary value be an indirect reference, so
+/// `/Count 12 0 R` is a legal shape. `Document::resolve` walks that chain under its own length
+/// and cycle bounds, so a reference that cannot be used keeps its specific failure instead of the
+/// misleading "expected integer" one.
+fn page_count(doc: &Document<'_>, dict: &Dict) -> Result<usize> {
+    let value = doc.resolve(get(dict, b"Count")?).map_err(|mut failure| {
+        failure.message = format!(
+            "PDF page tree Count reference cannot be used: {}",
+            failure.message
+        );
+        failure
+    })?;
+    value.integer().map_err(|_| {
+        bad("PDF page tree Count must be a bounded nonnegative integer or an indirect reference to one")
+    })
+}
 pub fn pages<'a>(doc: &'a Document<'_>, started: Instant) -> Result<Vec<Page<'a>>> {
     let catalog = doc.object(doc.root)?.value.dict()?;
     if get(catalog, b"Type")?.name()? != b"Catalog" {
@@ -82,7 +100,7 @@ fn walk<'a>(
             Ok(1)
         }
         b"Pages" => {
-            let expected = get(dict, b"Count")?.integer()?;
+            let expected = page_count(doc, dict)?;
             if expected > MAX_PAGES {
                 return Err(limit(
                     "PDF physical scan exceeds 32 pages; paging does not bypass this bound",
@@ -176,5 +194,78 @@ impl Streams {
             value => self.append(doc, value, &mut output, started)?,
         }
         Ok(output)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pdf_container::parse;
+    /// One-page classic-xref PDF; `extra` values become objects after the catalog, tree and page.
+    fn build(count: &str, extra: &[&str]) -> Vec<u8> {
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!("<< /Type /Pages /Kids [3 0 R] /Count {count} >>"),
+            "<< /Type /Page /Parent 2 0 R >>".to_string(),
+        ];
+        objects.extend(extra.iter().map(|value| value.to_string()));
+        let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        let mut offsets = vec![0];
+        for (index, value) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{value}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes(),
+        );
+        for offset in offsets.iter().skip(1) {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                offsets.len()
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+    fn observe(count: &str, extra: &[&str]) -> Result<usize> {
+        let bytes = build(count, extra);
+        let document = parse(&bytes).unwrap();
+        pages(&document, Instant::now()).map(|pages| pages.len())
+    }
+    #[test]
+    fn page_count_may_be_an_indirect_or_chained_reference() {
+        assert_eq!(observe("1", &[]).unwrap(), 1);
+        // Issue #646: a legal page tree whose /Count is an indirect reference.
+        assert_eq!(observe("4 0 R", &["1"]).unwrap(), 1);
+        assert_eq!(observe("4 0 R", &["5 0 R", "1"]).unwrap(), 1);
+    }
+    fn rejected(count: &str, extra: &[&str], expected: &str) {
+        let error = observe(count, extra).unwrap_err();
+        assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+        assert!(
+            error.message.contains("page tree Count"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains(expected), "{}", error.message);
+        assert!(
+            !error
+                .message
+                .contains("Expected a bounded nonnegative PDF integer"),
+            "{}",
+            error.message
+        );
+    }
+    #[test]
+    fn unusable_page_count_references_name_the_count_not_a_generic_integer() {
+        rejected("9 0 R", &[], "does not name an active object");
+        rejected("4 0 R", &["4 0 R"], "Cyclic PDF reference");
+        rejected("4 0 R", &["(one)"], "must be a bounded nonnegative integer");
+        rejected("4 0 R", &["-1"], "must be a bounded nonnegative integer");
+        // Resolving the reference does not lift the 32-page physical scan bound.
+        assert_eq!(observe("4 0 R", &["33"]).unwrap_err().code, "OUTPUT_LIMIT");
     }
 }

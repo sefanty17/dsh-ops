@@ -156,6 +156,12 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Inspect Windows Bash image and ancestor integrity labels in `ladder`, warn about Low labels, and keep unreadable labels and runtime health distinct from static payload compatibility (#446).
 - `ladder` 只读检查 Windows Bash 映像与祖先路径的完整性标签，告警 Low 标签，并区分不可读标签、运行时健康和静态载荷兼容性（#446）。
 
+- Read PDFs whose stream `/Length`, trailer `/Size` or page-tree `/Count` is an indirect
+  reference: resolve the chain through the xref table with bounded hops and cycle detection
+  instead of failing with "Expected a bounded nonnegative PDF integer" (#646).
+- 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
+  带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败（#646）。
+
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 
 - This unstable prerelease summarizes changes since v0.5.0-alpha2; use an isolated test environment.
