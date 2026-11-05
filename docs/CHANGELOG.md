@@ -180,6 +180,21 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - 读取文本层使用嵌入字体或 CID 字体的 PDF：Type0/Identity-H/V 字体与带 `ToUnicode` CMap 的简单
   字体现在能把字符码映射为 Unicode，此前只解码标准 Type1 编码；字形程序、`DescendantFonts` 与
   `CIDToGIDMap` 仍不读取（#646）。
+- Read PDFs with a single modern cross-reference section: a cross-reference stream (`/Type /XRef`
+  with `/W` and `/Index`) and object streams (`/Type /ObjStm`) are decoded into the bounded
+  object table. Incremental PDFs stay refused: a trailer with `/Prev` or `/XRefStm` reports the
+  file as unsupported (#432, #646).
+- 读取只有单个现代交叉引用区段的 PDF：xref 流（`/Type /XRef`，含 `/W`、`/Index`）与对象流
+  （`/Type /ObjStm`）解码进同一张有界对象表；增量 PDF 仍被拒绝——trailer 含 `/Prev` 或
+  `/XRefStm` 即报告为不支持（#432、#646）。
+- Bound object-stream expansion and nested object reads: an indirect `/N`, `/First` or stream
+  `/Length` that reaches another stream now stops at 8 nested object-stream expansions or 64
+  nested object reads, and an object stream that names itself or its own compressed object is
+  refused as cyclic. Malformed files return `OUTPUT_LIMIT` or `DOCUMENT_PARSE_ERROR` instead of
+  overflowing the worker stack (#646).
+- 对象流展开与嵌套对象读取的递归现在有界：间接 `/N`、`/First` 或流 `/Length` 指向另一条流时，
+  最多连续展开 8 层对象流或 64 层嵌套对象读取；对象流指向自身或其内部压缩对象时按循环结构
+  拒绝。畸形文件返回 `OUTPUT_LIMIT` 或 `DOCUMENT_PARSE_ERROR`，不再造成 worker 栈溢出（#646）。
 
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 
@@ -356,8 +371,9 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Let `/Prev` and `/XRefStm` be ordinary PDF dictionary keys: they mark an unsupported
   incremental update only as trailer keys, so an outline item's `/Prev` no longer makes the
-  whole document unreadable (#427).
-- 允许 `/Prev` 与 `/XRefStm` 作为普通 PDF 字典键：仅当它们出现在 trailer 中才表示不支持的增量更新，大纲项里的 `/Prev` 不再使整份文档被判不可读（#427）。
+  whole document unreadable (#427). A trailer that carries either key is still refused.
+- 允许 `/Prev` 与 `/XRefStm` 作为普通 PDF 字典键：仅当它们出现在 trailer 中才表示不支持的增量
+  更新，大纲项里的 `/Prev` 不再使整份文档被判不可读（#427）；trailer 携带其中任一键仍被拒绝。
 
 - Add current-scope `ops_status` diagnostics and public `diagnose(ctx, agent)` inspection; report integration, host/runtime, presentation and external provider readiness without executing or activating capabilities (#440).
 - 新增当前作用域 `ops_status` 与公开 `diagnose(ctx, agent)`，区分接入、宿主/运行时、展示及外部提供者状态，不执行或激活能力（#440）。

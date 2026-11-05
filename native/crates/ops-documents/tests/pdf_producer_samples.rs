@@ -1,10 +1,17 @@
-//! Producer-export fixtures: Firefox print-to-PDF and WPS Writer.
+//! Producer-export fixtures: Firefox print-to-PDF, WPS Writer and Word 2021.
 //!
 //! Firefox and WPS read end to end. Both embed Type0 Identity-H fonts whose
 //! `ToUnicode` CMaps carry the Unicode text, and they show a few codes per `Tj`,
 //! so a line arrives as many runs. These tests pin the decoded text: a regression
 //! in the operator whitelist, the font layer or the container turns the text
 //! empty, partial or garbled rather than silently passing.
+//!
+//! The Word 2021 export is a hybrid-reference document with an incremental
+//! update: its final classic xref table is an empty `0 0` subsection, and the
+//! trailer's `/Prev` (previous classic xref) and `/XRefStm` (xref stream) hold the
+//! real object entries, one of which is a `/Type /ObjStm` container. #432 keeps
+//! incremental PDFs unsupported, so the container refuses this export; the
+//! rejection test pins that as a product decision and its fonts stay unread.
 //!
 //! The final test guards the fixture bytes themselves, so a replaced sample can
 //! never silently change what the reader assertions mean.
@@ -15,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 const FIXTURES: &str = "tests/fixtures";
 const FIREFOX: &str = "producer-firefox-print.pdf";
+const WORD: &str = "producer-word2021.pdf";
 const WPS: &str = "producer-wps.pdf";
 
 fn fixture(name: &str) -> PathBuf {
@@ -95,6 +103,31 @@ fn wps_export_decodes_its_type0_fonts() {
     assert_reads(WPS, &output, &["中文测试", "季度报告与毛利率", "37.4%"]);
 }
 
+/// The Word 2021 export is a hybrid-reference PDF with an incremental update.
+///
+/// `startxref` points at a classic xref table whose only subsection is the empty `0 0`; the
+/// trailer's `/Prev 136746` (previous classic xref) and `/XRefStm 136356` (xref stream) hold the
+/// actual entries, and object 29 is a `/Type /ObjStm` container for objects 21..=54.
+///
+/// #432 keeps incremental updates unsupported, so the container stops at the empty subsection.
+/// This test pins the current gap as a product decision, not a bug to repair here: reading the
+/// export needs the incremental support that a separate change owns.
+#[test]
+fn word2021_incremental_export_is_rejected() {
+    let bytes = raw(WORD);
+    let error = ops_documents::pdf_container::parse(&bytes)
+        .expect_err("an incremental PDF must be refused");
+    assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+    assert!(
+        error.message.contains("subsection cannot be empty"),
+        "{}",
+        error.message
+    );
+    // The tool path reports the same container failure instead of a partial read.
+    let error = read_pdf(WORD).expect_err("the reader must not return a partial Word result");
+    assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+}
+
 /// True when `haystack` contains `needle`; PDF dictionary keys may be written
 /// with any whitespace, or none, before a name value.
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -133,5 +166,21 @@ fn fixtures_keep_the_producer_container_structure() {
         !contains_type(&wps, "ObjStm"),
         "WPS export must stay free of object streams; a replaced fixture would change what the \
          reader assertions cover"
+    );
+
+    let word = raw(WORD);
+    assert!(
+        word.starts_with(b"%PDF-1.7"),
+        "Word 2021 export must stay PDF 1.7; header is {:?}",
+        String::from_utf8_lossy(&word[..16.min(word.len())])
+    );
+    assert!(
+        contains_type(&word, "ObjStm") || contains_type(&word, "XRef"),
+        "Word 2021 export must keep its object stream or xref stream; without either it no longer \
+         exercises the hybrid-reference container that the rejection test pins"
+    );
+    assert!(
+        contains(&word, b"/Prev"),
+        "Word 2021 export must keep its incremental /Prev trailer key"
     );
 }

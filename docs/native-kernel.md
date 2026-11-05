@@ -251,25 +251,29 @@ reference pages retains the declared main-body scope independently of stored-row
 
 ## PDF parser foundation (15c/16)
 
-The internal PDF container parser accepts a restricted PDF 1.0-1.7 subset: one classic
-xref table, an exact final startxref/EOF footer, unique dictionary keys and object
-identities. Stream `/Length`, trailer `/Size` and page-tree `/Count` may be indirect; the
-chain is resolved through the xref table with bounded hops and cycle detection. Every active
-xref offset must point exactly at its object header. Objects cannot overlap; gaps must
-contain only whitespace or comments. This deliberately rejects incremental updates,
-encryption, object/xref streams, recovery scans and ambiguous duplicate data. `/Encrypt`,
-`/ObjStm` and `/XRef` are refused wherever they appear, decoded escapes included, while
-`/Prev` and `/XRefStm` are refused only as trailer keys — the one place they denote an
-earlier xref section — so a dictionary that merely names them, such as an outline item's
-previous sibling, stays readable.
+The internal PDF container parser accepts a restricted PDF 1.0-1.7 subset: one classic xref
+table or one cross-reference stream, plus object streams, with an exact final startxref/EOF
+footer, unique dictionary keys and object identities. Stream `/Length`, trailer `/Size` and
+page-tree `/Count` may be indirect; the chain is resolved through the xref table with bounded
+hops and cycle detection. Every xref offset must point exactly at its section or object header,
+objects cannot overlap, and the header region before the first object holds only whitespace or
+comments. Recovery scans, encryption, ambiguous duplicate data and incremental updates are
+refused. A trailer key `/Prev` or `/XRefStm` names an earlier xref section, so the container
+reports it as unsupported instead of following it; an outline item's `/Prev` for its previous
+sibling is an ordinary key. `/Encrypt` alone is refused at the name token because no supported
+structure can carry it.
 
 Bounds are checked before indexed allocation: 16 MiB per input, 10,000 xref entries,
-100,000 metadata values, depth 64, 4,096 keys per dictionary, 256 bytes per name/token,
-and 1 MiB per string or encoded/decoded stream. Reference chains have cycle detection
-and a depth bound. Streams support no filter or one FlateDecode only; external streams,
-filter chains and DecodeParms are declined. Actual decompression stops at the decoded
-limit plus one byte and requires a valid checksum, zlib terminator and exact consumption
-of the input. No size advertised by a PDF author bypasses these limits.
+100,000 metadata values, depth 64, 4,096 keys per dictionary, 4,096 objects per object
+stream, 256 bytes per name/token, 1 MiB per string or encoded/decoded stream, 8 MiB of
+decoded xref and object streams, 8 nested object-stream expansions and 64 nested object
+reads. Reference chains have cycle detection and a depth bound, and the container has a
+20-second deadline. An object stream that names itself or its own compressed object reports
+a cyclic-structure failure; a chain past either depth bound reports `OUTPUT_LIMIT`.
+Streams support no filter or one FlateDecode only; external streams, filter chains and
+DecodeParms are declined. Actual decompression stops at the decoded limit plus one byte and
+requires a valid checksum, zlib terminator and exact consumption of the input. No size
+advertised by a PDF author bypasses these limits.
 
 This slice exposes no tool and makes no text-coverage claim. Page-tree interpretation,
 the supported font/encoding subset, partial results and worker authority checks are
@@ -294,13 +298,13 @@ forms, images (XObject or inline) or shading is a gap, even when it also has sup
 text. Blank absent/null/empty/comment-only content yields an empty page; nonempty
 graphics without a supported text layer is explicitly unsupported.
 
-The supported text subset is PDF 1.3–1.7 with the foundation's classic xref container,
-standard Helvetica/Courier/Times Type1 families, built-in StandardEncoding printable
-characters (including its curly quote glyphs), named WinAnsiEncoding, Type0 fonts with the
-predefined Identity-H/V encoding, and fonts carrying a `ToUnicode` CMap. The WinAnsi
-bullet/space/hyphen aliases are explicit; unknown/control codes are refused without
-replacement. Glyph programs, `DescendantFonts`, `CIDToGIDMap` and encoding differences are
-never read. Earlier PDF encodings are declined rather than reinterpreted. The mapping
+The supported text subset is PDF 1.3–1.7 with the container above, standard
+Helvetica/Courier/Times Type1 families, built-in StandardEncoding printable characters
+(including its curly quote glyphs), named WinAnsiEncoding, Type0 fonts with the predefined
+Identity-H/V encoding, and fonts carrying a `ToUnicode` CMap. The WinAnsi bullet/space/
+hyphen aliases are explicit; unknown/control codes are refused without replacement. Glyph
+programs, `DescendantFonts`, `CIDToGIDMap` and encoding differences are never read. Earlier
+PDF encodings are declined rather than reinterpreted. The mapping
 and operator semantics follow the [Adobe-hosted ISO 32000-1 reference, sections 9.4/9.6
 and Annex D](https://developer.adobe.com/document-services/docs/assets/35e4369068f86065372c18787171a17e/PDF_ISO_32000-1.pdf).
 

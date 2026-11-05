@@ -75,15 +75,31 @@ fn duplicate_keys_and_escaped_unsupported_names_are_rejected() {
     ] {
         rejected(&fixture(&[value]), "DOCUMENT_PARSE_ERROR");
     }
-    for name in ["Encrypt", "Enc#72ypt", "ObjStm", "XRef"] {
+    // `/Encrypt` is the only name the container cannot interpret at any level, and an escaped
+    // spelling must decode to it before the check. `/Prev`, `/XRefStm`, `/ObjStm` and `/XRef` are
+    // ordinary names: the container reads the last two as stream types and the first two only
+    // where a trailer is read.
+    for name in ["Encrypt", "E#6ecrypt", "Enc#72ypt"] {
         rejected(
             &fixture(&[format!("<< /{name} null >>").as_bytes()]),
             "UNSUPPORTED_DOCUMENT",
         );
     }
+    // A trailer key is the one place either name means an earlier revision. The escaped spelling
+    // must decode before the check, and single-revision files with it are refused as incremental.
+    let pdf = fixture(&[b"<<>>"]);
+    for key in [b"/Prev".as_slice(), b"/Pr#65v", b"/XRefStm"] {
+        let mut trailer = b"/Root 1 0 R ".to_vec();
+        trailer.extend_from_slice(key);
+        trailer.extend_from_slice(b" 9 0 R >>");
+        rejected(
+            &replace(&pdf, b"/Root 1 0 R >>", &trailer),
+            "UNSUPPORTED_DOCUMENT",
+        );
+    }
 }
 #[test]
-fn outline_prev_is_an_ordinary_key_while_a_trailer_prev_stays_unsupported() {
+fn outline_prev_is_an_ordinary_object_key() {
     // An outline item names its previous sibling with /Prev, which is not an
     // incremental-update marker; refusing the token made the whole document
     // unreadable (#427).
@@ -97,16 +113,7 @@ fn outline_prev_is_an_ordinary_key_while_a_trailer_prev_stays_unsupported() {
     let document = parse(&pdf).unwrap();
     let second = document.object((5, 0)).unwrap().value.dict().unwrap();
     assert!(matches!(get(second, b"Prev").unwrap(), Value::Ref(4, 0)));
-    // The same names still refuse a file that really has an earlier xref section.
-    for key in [b"/Prev".as_slice(), b"/Pr#65v", b"/XRefStm"] {
-        let mut trailer = b"/Root 1 0 R ".to_vec();
-        trailer.extend_from_slice(key);
-        trailer.extend_from_slice(b" 9 0 R >>");
-        rejected(
-            &replace(&pdf, b"/Root 1 0 R >>", &trailer),
-            "UNSUPPORTED_DOCUMENT",
-        );
-    }
+    assert!(matches!(get(second, b"XRefStm").unwrap(), Value::Ref(4, 0)));
 }
 #[test]
 fn offset_alias_overlap_and_unindexed_data_are_never_recovered() {
