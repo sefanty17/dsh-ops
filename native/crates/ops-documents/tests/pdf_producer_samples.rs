@@ -1,14 +1,10 @@
 //! Producer-export fixtures: Firefox print-to-PDF and WPS Writer.
 //!
-//! Firefox and WPS place graphics-state and marked-content operators where the
-//! classic operator whitelist refused them: Firefox failed with
-//! `Unsupported PDF content operator gs` and WPS with `Non-text PDF operator
-//! inside a text object`. Once the operator whitelist accepts those operators,
-//! both exports reach the font layer instead, where the embedded Type0 fonts are
-//! still unsupported: the scan reports `status: "partial"`, an error that names
-//! fonts, and no page text. These two assertions are therefore red on the
-//! pre-extension reader and green after the extension; they are the signal that
-//! the operator gap moved down to fonts.
+//! Firefox and WPS read end to end. Both embed Type0 Identity-H fonts whose
+//! `ToUnicode` CMaps carry the Unicode text, and they show a few codes per `Tj`,
+//! so a line arrives as many runs. These tests pin the decoded text: a regression
+//! in the operator whitelist, the font layer or the container turns the text
+//! empty, partial or garbled rather than silently passing.
 //!
 //! The final test guards the fixture bytes themselves, so a replaced sample can
 //! never silently change what the reader assertions mean.
@@ -49,67 +45,54 @@ fn read_pdf(name: &str) -> Result<Value, Failure> {
     ops_documents::dispatch(&request)
 }
 
-fn message(output: &Value) -> &str {
-    output["error"]["message"].as_str().unwrap_or("")
-}
-
-/// The export got past every content operator and stopped at the font layer.
+/// The single page's text with the run separators removed.
 ///
-/// `pre_extension` is the operator error this fixture produced before the
-/// whitelist covered its graphics-state/marked-content operators; naming it keeps
-/// a regression that re-rejects those operators self-explanatory.
-///
-/// The named font error and the empty page text are current-stage pins: they hold
-/// while Type0 fonts are unsupported. When embedded fonts become readable the scan
-/// may complete with text, so the empty-text assertion below must be relaxed then;
-/// the status check already accepts `completed`.
-fn assert_reaches_the_font_layer(name: &str, pre_extension: &str, output: &Value) {
-    let status = output["status"].as_str().unwrap_or("");
-    assert!(
-        status == "partial" || status == "completed",
-        "{name}: expected a partial or completed scan once the operator whitelist covers this \
-         export, got status {status:?}: {output}"
-    );
-    let message = message(output);
-    assert!(
-        !message.contains("operator"),
-        "{name}: the reader still fails on a non-text operator ({message:?}), which is exactly the \
-         {pre_extension:?} failure the operator extension is meant to remove: {output}"
-    );
-    if status == "partial" {
-        assert!(
-            message.contains("font"),
-            "{name}: a partial scan must stop at the font layer (embedded Type0 fonts); got \
-             {message:?}: {output}"
-        );
-    }
-    // Current-stage pin, not an endorsement: Type0 fonts are unsupported, so the
-    // scan must not report page text it cannot decode. A completed scan with text
-    // is the expected shape once embedded fonts are readable; relax this then.
+/// Firefox and WPS show a few codes per `Tj`, so the reader reports many runs per
+/// line; joining them is the only way to compare the produced text with the
+/// document's words.
+fn page_text(name: &str, output: &Value) -> String {
     let items = output["items"]
         .as_array()
         .unwrap_or_else(|| panic!("{name}: items must be an array: {output}"));
-    for item in items {
-        let text = item["text"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{name}: item text must be a string: {output}"));
+    assert_eq!(items.len(), 1, "{name}: one page expected: {output}");
+    items[0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name}: item text must be a string: {output}"))
+        .replace('\n', "")
+}
+
+/// The export completed and its text contains every `expected` fragment.
+fn assert_reads(name: &str, output: &Value, expected: &[&str]) {
+    assert_eq!(
+        output["status"], "completed",
+        "{name}: the export must read completely once its fonts decode: {output}"
+    );
+    assert!(
+        output.get("error").is_none(),
+        "{name}: a completed scan must not report a failure: {output}"
+    );
+    let text = page_text(name, output);
+    for fragment in expected {
         assert!(
-            text.is_empty(),
-            "{name}: no page text is decodable while Type0 fonts are unsupported; got {text:?}: {output}"
+            text.contains(fragment),
+            "{name}: expected {fragment:?} in the decoded text, got {text:?}"
         );
     }
 }
 
 #[test]
-fn firefox_print_export_reaches_the_font_layer() {
+fn firefox_print_export_decodes_its_type0_fonts() {
     let output = read_pdf(FIREFOX).expect("Firefox print export must still parse its classic xref");
-    assert_reaches_the_font_layer(FIREFOX, "Unsupported PDF content operator gs", &output);
+    // Type0 Identity-H fonts with a ToUnicode CMap, shown a few codes per `Tj`.
+    assert_reads(FIREFOX, &output, &["中文测试", "Q3 Report", "Gross margin 37.4"]);
 }
 
 #[test]
-fn wps_export_reaches_the_font_layer() {
+fn wps_export_decodes_its_type0_fonts() {
     let output = read_pdf(WPS).expect("WPS export must still parse its classic xref");
-    assert_reaches_the_font_layer(WPS, "Non-text PDF operator inside a text object", &output);
+    // WPS positions words instead of showing space glyphs, so the joined text has no
+    // spaces and the assertions stay on fragments that survive the run join.
+    assert_reads(WPS, &output, &["中文测试", "季度报告与毛利率", "37.4%"]);
 }
 
 /// True when `haystack` contains `needle`; PDF dictionary keys may be written

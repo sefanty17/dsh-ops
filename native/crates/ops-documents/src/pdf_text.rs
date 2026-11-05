@@ -1,103 +1,75 @@
-//! PDF text operators for standard Latin Type1 fonts. No glyph substitution or layout inference.
+//! PDF text operators over decoded character codes. No glyph substitution or layout inference.
 use crate::{
-    pdf_container::{Document, get},
-    pdf_syntax::{Dict, Lexer, Value, bad, limit, unsupported},
+    pdf_container::{Document, ObjectId, get},
+    pdf_font::FontDecoder,
+    pdf_limits::{MAX_CONTENT_DECODED, MAX_TEXT, deadline},
+    pdf_syntax::{Lexer, Value, bad, limit, unsupported},
 };
-use ops_protocol::{Failure, Result};
-use std::time::{Duration, Instant};
-pub const MAX_TEXT: usize = 1024 * 1024;
-pub fn deadline(started: Instant) -> Result<()> {
-    if started.elapsed() >= Duration::from_secs(30) {
-        return Err(Failure::new(
-            "DEADLINE_EXCEEDED",
-            "PDF reading reached its 30-second deadline",
-        ));
-    }
-    Ok(())
+use ops_protocol::Result;
+use std::{collections::BTreeMap, rc::Rc, time::Instant};
+/// Fonts whose character-code tables one document may decode.
+pub const MAX_FONTS: usize = 64;
+/// The character-code decoder one `Tf` selected, built on the first operator that shows text.
+#[derive(Clone)]
+enum Selection {
+    /// The `/Font` resource value. Nothing has been decoded for it yet, so a font the page
+    /// selects but never uses cannot fail the page.
+    Named(Value),
+    /// The decoder built for that resource.
+    Decoded(Rc<FontDecoder>),
 }
-#[derive(Clone, Copy)]
-enum Encoding {
-    Standard,
-    WinAnsi,
+/// The fonts one document has decoded, keyed by the object that holds each font dictionary.
+///
+/// Page resources are never decoded up front: a font is built the first time a showing operator
+/// needs it, and every later use of the same font object reuses that decoder.
+pub struct Fonts {
+    cache: BTreeMap<ObjectId, Rc<FontDecoder>>,
 }
-fn font(doc: &Document<'_>, resources: &Dict, name: &[u8]) -> Result<Encoding> {
-    let fonts = doc.resolve(get(resources, b"Font")?)?.dict()?;
-    let font = doc.resolve(get(fonts, name)?)?.dict()?;
-    if get(font, b"Type")?.name()? != b"Font" || get(font, b"Subtype")?.name()? != b"Type1" {
-        return Err(unsupported("PDF text requires standard Latin Type1 fonts"));
-    }
-    if font.contains_key(b"ToUnicode".as_slice()) || font.contains_key(b"FontDescriptor".as_slice())
-    {
-        return Err(unsupported(
-            "PDF embedded fonts and ToUnicode mappings are unsupported",
-        ));
-    }
-    if !matches!(
-        get(font, b"BaseFont")?.name()?,
-        b"Helvetica"
-            | b"Helvetica-Bold"
-            | b"Helvetica-Oblique"
-            | b"Helvetica-BoldOblique"
-            | b"Courier"
-            | b"Courier-Bold"
-            | b"Courier-Oblique"
-            | b"Courier-BoldOblique"
-            | b"Times-Roman"
-            | b"Times-Bold"
-            | b"Times-Italic"
-            | b"Times-BoldItalic"
-    ) {
-        return Err(unsupported(
-            "PDF font is outside the standard Helvetica/Courier/Times families",
-        ));
-    }
-    match font.get(b"Encoding".as_slice()) {
-        None => Ok(Encoding::Standard),
-        Some(Value::Name(name)) if name == b"WinAnsiEncoding" => Ok(Encoding::WinAnsi),
-        _ => Err(unsupported(
-            "PDF font requires built-in StandardEncoding or named WinAnsiEncoding; differences and other encodings are unsupported",
-        )),
-    }
-}
-fn text(bytes: &[u8], encoding: Encoding) -> Result<String> {
-    // ISO 32000-1 Annex D: WinAnsi differs from a generic CP1252 decoder at bullet/space/hyphen slots.
-    const C1: [char; 32] = [
-        '€', '•', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '•', 'Ž', '•', '•', '‘',
-        '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '•', 'ž', 'Ÿ',
-    ];
-    let mut output = String::new();
-    for &byte in bytes {
-        let c = match encoding {
-            Encoding::Standard => match byte {
-                39 => '’',
-                96 => '‘',
-                32..=126 => byte as char,
-                _ => {
-                    return Err(unsupported(
-                        "PDF StandardEncoding character is outside the supported printable Latin subset",
-                    ));
-                }
-            },
-            Encoding::WinAnsi => match byte {
-                32..=126 => byte as char,
-                127 => '•',
-                128..=159 => C1[(byte - 128) as usize],
-                160 => ' ',
-                173 => '-',
-                161..=255 => byte as char,
-                _ => {
-                    return Err(unsupported(
-                        "PDF WinAnsi character has no supported glyph mapping",
-                    ));
-                }
-            },
-        };
-        if output.len() + c.len_utf8() > MAX_TEXT {
-            return Err(limit("PDF text run exceeds 1 MiB"));
+impl Fonts {
+    pub fn new() -> Self {
+        Self {
+            cache: BTreeMap::new(),
         }
-        output.push(c);
     }
-    Ok(output)
+    /// The decoder for one `/Font` resource, built once per font object.
+    ///
+    /// `decoded` is the document's decoded-stream budget: the `ToUnicode` bytes the new decoder
+    /// reports are charged to it, so a document cannot buy decompression work by spreading large
+    /// tables over many fonts. An inline font dictionary is charged on every selection because it
+    /// has no object identity to cache, which is the work showing text with it really costs.
+    fn decoder(
+        &mut self,
+        doc: &Document<'_>,
+        value: &Value,
+        decoded: &mut usize,
+    ) -> Result<Rc<FontDecoder>> {
+        let id = font_object(value);
+        if let Some(id) = id {
+            if let Some(decoder) = self.cache.get(&id) {
+                return Ok(Rc::clone(decoder));
+            }
+            if self.cache.len() >= MAX_FONTS {
+                return Err(limit("PDF document selects more than 64 distinct fonts"));
+            }
+        }
+        let decoder = Rc::new(FontDecoder::from_value(doc, value)?);
+        let size = decoder.decoded_bytes();
+        if *decoded + size > MAX_CONTENT_DECODED {
+            return Err(limit("PDF aggregate decoded streams exceed 16 MiB"));
+        }
+        *decoded += size;
+        if let Some(id) = id {
+            self.cache.insert(id, Rc::clone(&decoder));
+        }
+        Ok(decoder)
+    }
+}
+/// The object holding a font dictionary, when the `/Font` resource is an indirect reference.
+fn font_object(value: &Value) -> Option<ObjectId> {
+    match value {
+        Value::Ref(number, generation) => Some((*number, *generation)),
+        _ => None,
+    }
 }
 fn numeric(value: &Value) -> bool {
     matches!(value, Value::Integer(_) | Value::Number(_))
@@ -117,10 +89,27 @@ fn named(args: &[Value], count: usize) -> Result<()> {
     }
     Ok(())
 }
-fn string(value: &Value, encoding: Encoding) -> Result<String> {
+fn string(value: &Value, decoder: &FontDecoder) -> Result<String> {
     match value {
-        Value::String(bytes) => text(bytes, encoding),
+        Value::String(bytes) => decoder.decode(bytes),
         _ => Err(bad("PDF text-showing operand is not a string")),
+    }
+}
+/// The decoder of the font a `Tf` selected, built on first use and cached from then on.
+fn selected_decoder(
+    doc: &Document<'_>,
+    fonts: &mut Fonts,
+    decoded: &mut usize,
+    selected: &mut Option<Selection>,
+) -> Result<Rc<FontDecoder>> {
+    match selected.as_mut() {
+        None => Err(bad("PDF text show before a font is selected")),
+        Some(Selection::Decoded(decoder)) => Ok(Rc::clone(decoder)),
+        Some(Selection::Named(value)) => {
+            let decoder = fonts.decoder(doc, value, decoded)?;
+            *selected = Some(Selection::Decoded(Rc::clone(&decoder)));
+            Ok(decoder)
+        }
     }
 }
 // Operators tolerated inside a text object although they are not text operators. Each sets
@@ -152,11 +141,17 @@ fn tolerated_in_text(op: &[u8]) -> bool {
             | b"DP"
     )
 }
+/// Extract the text runs of one page content stream in content order.
+///
+/// `fonts` caches the decoders of every font the document has already selected, and `decoded`
+/// is the document's decoded-stream budget, which each newly decoded font table is charged to.
 pub fn extract(
     doc: &Document<'_>,
     resources: Option<&Value>,
     bytes: &[u8],
     started: Instant,
+    fonts: &mut Fonts,
+    decoded: &mut usize,
 ) -> Result<Vec<String>> {
     if bytes.iter().all(|b| crate::pdf_syntax::white(*b)) {
         return Ok(Vec::new());
@@ -232,14 +227,16 @@ pub fn extract(
                 let resources = doc
                     .resolve(resources.ok_or_else(|| bad("Missing PDF page Resources"))?)?
                     .dict()?;
-                selected = Some(font(doc, resources, args[0].name()?)?);
+                let font_resources = doc.resolve(get(resources, b"Font")?)?.dict()?;
+                // Only the resource lookup happens here: the font is decoded when text is shown.
+                let value = get(font_resources, args[0].name()?)?;
+                selected = Some(Selection::Named(value.clone()));
             }
             b"Tj" | b"TJ" | b"'" | b"\"" => {
                 if !inside {
                     return Err(bad("PDF text show outside text object"));
                 }
-                let encoding = selected
-                    .ok_or_else(|| bad("PDF text show before a supported font is selected"))?;
+                let decoder = selected_decoder(doc, fonts, decoded, &mut selected)?;
                 shown = Some(match op {
                     b"TJ" => {
                         if args.len() != 1 {
@@ -253,7 +250,7 @@ pub fn extract(
                             if numeric(part) {
                                 continue;
                             }
-                            let fragment = string(part, encoding)?;
+                            let fragment = string(part, &decoder)?;
                             if run.len() + fragment.len() > MAX_TEXT {
                                 return Err(limit("PDF text run exceeds 1 MiB"));
                             }
@@ -266,13 +263,13 @@ pub fn extract(
                             return Err(bad("Invalid PDF quote arguments"));
                         }
                         numbers(&args[..2], 2)?;
-                        string(&args[2], encoding)?
+                        string(&args[2], &decoder)?
                     }
                     _ => {
                         if args.len() != 1 {
                             return Err(bad("Invalid PDF text-show arguments"));
                         }
-                        string(&args[0], encoding)?
+                        string(&args[0], &decoder)?
                     }
                 });
             }
@@ -293,19 +290,13 @@ pub fn extract(
             }
             b"q" => {
                 no_args(&args)?;
-                if inside {
-                    return Err(unsupported("PDF q inside a text object is unsupported"));
-                }
                 if stack.len() >= 64 {
                     return Err(limit("PDF graphics state exceeds depth 64"));
                 }
-                stack.push(selected)
+                stack.push(selected.clone())
             }
             b"Q" => {
                 no_args(&args)?;
-                if inside {
-                    return Err(unsupported("PDF Q inside a text object is unsupported"));
-                }
                 selected = stack.pop().ok_or_else(|| bad("Unbalanced PDF Q"))?
             }
             b"cm" | b"c" => numbers(&args, 6)?,
@@ -410,17 +401,17 @@ pub fn extract(
 mod tests {
     use super::*;
     use crate::pdf_container::parse;
-    /// One page whose `/Resources` aliases Helvetica as `/F1` and `/FT8`; content is per test.
-    fn document_bytes() -> Vec<u8> {
-        let objects = [
-            "<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R /FT8 4 0 R >> >> >>",
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    /// One page whose `/Font` resources are `fonts`; `objects` become `4 0 obj` onward.
+    fn document_with(fonts: &str, objects: &[String]) -> Vec<u8> {
+        let mut all = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            format!("<< /Type /Page /Parent 2 0 R /Resources << /Font {fonts} >> >>"),
         ];
+        all.extend(objects.iter().cloned());
         let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
         let mut offsets = vec![0];
-        for (index, value) in objects.iter().enumerate() {
+        for (index, value) in all.iter().enumerate() {
             offsets.push(pdf.len());
             pdf.extend_from_slice(format!("{} 0 obj\n{value}\nendobj\n", index + 1).as_bytes());
         }
@@ -438,6 +429,13 @@ mod tests {
         );
         pdf
     }
+    /// One page whose `/Resources` aliases Helvetica as `/F1` and `/FT8`; content is per test.
+    fn document_bytes() -> Vec<u8> {
+        document_with(
+            "<< /F1 4 0 R /FT8 4 0 R >>",
+            &["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string()],
+        )
+    }
     fn extract_text(content: &[u8]) -> Result<Vec<String>> {
         let bytes = document_bytes();
         let document = parse(&bytes).unwrap();
@@ -447,7 +445,134 @@ mod tests {
             page.get(b"Resources".as_slice()),
             content,
             Instant::now(),
+            &mut Fonts::new(),
+            &mut 0,
         )
+    }
+    /// Extract `content` from a document whose page names `fonts`, with the decoded bytes the
+    /// font layer charged to the shared budget.
+    fn extract_with(
+        fonts: &str,
+        objects: &[String],
+        content: &[u8],
+    ) -> Result<(Vec<String>, usize)> {
+        extract_spending(fonts, objects, content, 0)
+    }
+    /// Extract `content` while `spent` decoded bytes are already charged to the shared budget.
+    fn extract_spending(
+        fonts: &str,
+        objects: &[String],
+        content: &[u8],
+        spent: usize,
+    ) -> Result<(Vec<String>, usize)> {
+        let bytes = document_with(fonts, objects);
+        let document = parse(&bytes).unwrap();
+        let page = document.object((3, 0)).unwrap().value.dict().unwrap();
+        let mut cached = Fonts::new();
+        let mut decoded = spent;
+        let runs = extract(
+            &document,
+            page.get(b"Resources".as_slice()),
+            content,
+            Instant::now(),
+            &mut cached,
+            &mut decoded,
+        )?;
+        Ok((runs, decoded))
+    }
+    /// One `ToUnicode` CMap stream object mapping one-byte codes `01`/`02` to `Q`/`3`.
+    fn cmap_stream(body: &str) -> String {
+        format!(
+            "<< /Length {} >>\nstream\n{body}\nendstream",
+            body.len()
+        )
+    }
+    const CMAP_BODY: &str = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+        /CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+        2 beginbfchar\n<01> <0051>\n<02> <0033>\nendbfchar\n\
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+    /// A simple TrueType font whose character codes come from a `ToUnicode` CMap.
+    fn to_unicode_font() -> Vec<String> {
+        vec![
+            "<< /Type /Font /Subtype /TrueType /BaseFont /BAAAAA+LiberationMono \
+             /ToUnicode 5 0 R >>"
+                .to_string(),
+            cmap_stream(CMAP_BODY),
+        ]
+    }
+    #[test]
+    fn a_selected_font_that_shows_no_text_cannot_fail_the_page() {
+        let fonts = "<< /F1 4 0 R /F2 5 0 R >>";
+        let objects = [
+            "<< /Type /Font /Subtype /Type3 /FontMatrix [1 0 0 1 0 0] >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        // Selecting `/F1` alone is not a failure: only a showing operator needs its decoder.
+        let (runs, _) = extract_with(fonts, &objects, b"BT /F1 12 Tf /F2 12 Tf (ok) Tj ET").unwrap();
+        assert_eq!(runs, ["ok"]);
+        let error = extract_with(fonts, &objects, b"BT /F1 12 Tf (ok) Tj ET").unwrap_err();
+        assert_eq!(error.code, "UNSUPPORTED_DOCUMENT", "{}", error.message);
+    }
+    #[test]
+    fn one_font_object_charges_its_table_once() {
+        let objects = to_unicode_font();
+        let (runs, decoded) =
+            extract_with("<< /F1 4 0 R /F2 4 0 R >>", &objects, b"BT /F1 12 Tf <0102> Tj /F2 12 Tf <0102> Tj ET")
+                .unwrap();
+        assert_eq!(runs, ["Q3", "Q3"]);
+        assert_eq!(
+            decoded,
+            CMAP_BODY.len(),
+            "the same font object must be decoded and charged once"
+        );
+    }
+    #[test]
+    fn a_font_table_is_charged_once_against_the_shared_decoded_budget() {
+        let objects = to_unicode_font();
+        let content = b"BT /F1 12 Tf <0102> Tj ET";
+        // One byte short of the table's decoded size leaves no room for it.
+        let error = extract_spending(
+            "<< /F1 4 0 R >>",
+            &objects,
+            content,
+            MAX_CONTENT_DECODED - CMAP_BODY.len() + 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "OUTPUT_LIMIT", "{}", error.message);
+        assert!(error.message.contains("16 MiB"), "{}", error.message);
+        // The exact remaining budget accepts the table and charges its decoded length once.
+        let (runs, decoded) = extract_spending(
+            "<< /F1 4 0 R >>",
+            &objects,
+            content,
+            MAX_CONTENT_DECODED - CMAP_BODY.len(),
+        )
+        .unwrap();
+        assert_eq!(runs, ["Q3"]);
+        assert_eq!(decoded, MAX_CONTENT_DECODED);
+    }
+    #[test]
+    fn more_than_64_selected_fonts_exceed_the_font_budget() {
+        let names: Vec<String> = (1..=65).map(|index| format!("/F{index}")).collect();
+        let fonts = format!(
+            "<< {} >>",
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| format!("{name} {} 0 R", index + 4))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let objects = (0..65)
+            .map(|_| "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string())
+            .collect::<Vec<_>>();
+        let content = names
+            .iter()
+            .map(|name| format!("BT {name} 12 Tf (a) Tj ET\n"))
+            .collect::<String>();
+        let error = extract_with(&fonts, &objects, content.as_bytes()).unwrap_err();
+        assert_eq!(error.code, "OUTPUT_LIMIT", "{}", error.message);
+        assert!(error.message.contains("64"), "{}", error.message);
     }
     #[test]
     fn graphics_state_and_colour_inside_a_text_object_keep_the_text() {
@@ -460,7 +585,7 @@ mod tests {
     }
     #[test]
     fn graphics_state_and_marked_content_outside_a_text_object_are_skipped() {
-        // A Chrome (Skia) export: an external graphics state, then marked content around the text.
+        // A browser print (Skia) export: an external graphics state, then marked content.
         let runs =
             extract_text(b"q /G3 gs /NonStruct << /MCID 0 >> BDC BT /F1 12 Tf (Hi) Tj ET EMC Q")
                 .unwrap();
@@ -532,6 +657,8 @@ mod tests {
             b"BT /F1 12 Tf (A) Tj /Im1 Do ET".as_slice(),
             b"BT /F1 12 Tf (A) Tj BI /W 1 /H 1 ID x EI ET",
             b"BT /F1 12 Tf (A) Tj 0 0 m 1 1 l S ET",
+            b"BT /F1 12 Tf (A) Tj q ET",
+            b"BT /F1 12 Tf (A) Tj Q ET",
         ] {
             let error = extract_text(content).unwrap_err();
             assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);

@@ -296,18 +296,20 @@ graphics without a supported text layer is explicitly unsupported.
 
 The supported text subset is PDF 1.3–1.7 with the foundation's classic xref container,
 standard Helvetica/Courier/Times Type1 families, built-in StandardEncoding printable
-characters (including its curly quote glyphs), or named WinAnsiEncoding. The WinAnsi
+characters (including its curly quote glyphs), named WinAnsiEncoding, Type0 fonts with the
+predefined Identity-H/V encoding, and fonts carrying a `ToUnicode` CMap. The WinAnsi
 bullet/space/hyphen aliases are explicit; unknown/control codes are refused without
-replacement. Embedded/custom fonts, ToUnicode/CID maps and encoding differences are
-unsupported. Earlier PDF encodings are declined rather than reinterpreted. The mapping
+replacement. Glyph programs, `DescendantFonts`, `CIDToGIDMap` and encoding differences are
+never read. Earlier PDF encodings are declined rather than reinterpreted. The mapping
 and operator semantics follow the [Adobe-hosted ISO 32000-1 reference, sections 9.4/9.6
 and Annex D](https://developer.adobe.com/document-services/docs/assets/35e4369068f86065372c18787171a17e/PDF_ISO_32000-1.pdf).
 
 Physical scanning stops at 32 pages, 30 seconds, 1 MiB decoded content per page, 64
 content streams per page, 1 MiB text/10,000 runs per page, and 16 MiB aggregate decoded
 streams **and** 16 MiB processed stream bytes. Shared streams decode once but every
-reuse counts against processed work. The existing 16 MiB file and per-stream limits
-also apply. Page offsets do not bypass any physical bound.
+reuse counts against processed work; each `ToUnicode` table is decoded once per font
+object and charged to the aggregate decoded budget. The existing 16 MiB file and
+per-stream limits also apply. Page offsets do not bypass any physical bound.
 
 scanComplete concerns the entire bounded text scope; pageComplete concerns the
 requested page range and becomes false on file changes. pagesObserved and skipped

@@ -173,6 +173,13 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   操作符（`BMC`/`BDC`/`EMC`、`MP`/`DP`），不再整页失败。WPS 与 Firefox 导出的文件现在会进入
   字体层而非报操作符错误；表单、内联图片与渐变仍不支持。中英文 PDF worker 文档同步列出这组
   操作符（#646）。
+- Read PDFs whose text layer uses an embedded or CID font: Type0/Identity-H/V fonts and simple
+  fonts carrying a `ToUnicode` CMap now map character codes to Unicode, where only standard
+  Type1 encodings were decoded before. Glyph programs, `DescendantFonts` and `CIDToGIDMap`
+  are never read (#646).
+- 读取文本层使用嵌入字体或 CID 字体的 PDF：Type0/Identity-H/V 字体与带 `ToUnicode` CMap 的简单
+  字体现在能把字符码映射为 Unicode，此前只解码标准 Type1 编码；字形程序、`DescendantFonts` 与
+  `CIDToGIDMap` 仍不读取（#646）。
 
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 

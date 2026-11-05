@@ -55,12 +55,21 @@ pub fn read(request: &Request) -> Result<Value> {
     }
     let pages = pdf_pages::pages(&document, started)?;
     let mut streams = Streams::new();
+    // Font tables decode through the same aggregate budget as page content streams.
+    let mut fonts = pdf_text::Fonts::new();
     let (mut observed, mut selected, mut inline_bytes) = (0usize, 0usize, 0usize);
     let (mut items, mut failure, mut cut) = (Vec::new(), None, false);
     for (index, page) in pages.iter().enumerate() {
-        let result = streams
-            .content(&document, page, started)
-            .and_then(|content| pdf_text::extract(&document, page.resources, &content, started));
+        let result = streams.content(&document, page, started).and_then(|content| {
+            pdf_text::extract(
+                &document,
+                page.resources,
+                &content,
+                started,
+                &mut fonts,
+                &mut streams.decoded,
+            )
+        });
         let runs = match result {
             Ok(runs) => runs,
             Err(error) => {
@@ -164,7 +173,7 @@ mod tests {
     fn expired_pdf_deadline_is_an_explicit_failure() {
         let expired = Instant::now() - std::time::Duration::from_secs(30);
         assert_eq!(
-            pdf_text::deadline(expired).unwrap_err().code,
+            crate::pdf_limits::deadline(expired).unwrap_err().code,
             "DEADLINE_EXCEEDED"
         );
     }

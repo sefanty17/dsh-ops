@@ -130,7 +130,7 @@ Cooperating writers serialise on a hidden update-lock sidecar beside each target
 
 ### Document readers
 
-`ops_read_table` reads CSV/TSV string cells (UTF-8 by default, with explicit UTF-16LE/BE support). `ops_read_docx` reads DOCX main-body paragraphs and table coordinates, not legacy binary DOC. Both default to offset 1 and limit 200 (maximum 1000), with a 32 MiB input bound. `ops_read_pdf` handles only PDF 1.3–1.7 classic xref and standard Type 1 font text, up to 16 MiB/32 pages; offset defaults to 1 and limit to 10 (maximum 32). It excludes OCR, embedded fonts and modern object/xref streams.
+`ops_read_table` reads CSV/TSV string cells (UTF-8 by default, with explicit UTF-16LE/BE support). `ops_read_docx` reads DOCX main-body paragraphs and table coordinates, not legacy binary DOC. Both default to offset 1 and limit 200 (maximum 1000), with a 32 MiB input bound. `ops_read_pdf` handles only PDF 1.3–1.7 classic xref text, with standard Type 1, WinAnsi, Identity-H/V and `ToUnicode` font mappings, up to 16 MiB/32 pages; offset defaults to 1 and limit to 10 (maximum 32). It excludes OCR, image and vector content, and embedded glyph programs.
 
 Each reader separates scan, page, display and reference-capture completeness. A later error may retain safe preceding complete records, but cannot produce a false full total or revision; an offset cannot bypass a physical scan gap. See [native kernel contracts](native-kernel.md) for all format bounds, encoding rules and recovery guidance.
 

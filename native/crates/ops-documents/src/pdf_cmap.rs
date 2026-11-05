@@ -1,7 +1,4 @@
 //! Bounded `ToUnicode` CMap decoding: character codes to Unicode. Glyph programs are never read.
-//!
-//! The font layer is the only caller; until it lands, this module is exercised by its own tests.
-#![allow(dead_code)]
 use crate::pdf_syntax::{Lexer, Value, bad, limit, unsupported};
 use ops_protocol::Result;
 use std::collections::BTreeMap;

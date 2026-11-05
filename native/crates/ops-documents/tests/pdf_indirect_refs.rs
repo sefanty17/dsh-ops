@@ -474,13 +474,12 @@ fn has_indirect_length(bytes: &[u8]) -> bool {
 /// A genuine LibreOffice export, the reporter's production path.
 ///
 /// The fixture is a real `soffice --convert-to pdf` output: PDF 1.7, the UTF-8
-/// `%äüöß` second line, and two indirect `/Length` references. It pins two facts:
-/// the container now parses such a file (the #646 fix), and text extraction gets
-/// through the content layer (marked content and external graphics state) but still
-/// stops at the embedded font. The second assertion is deliberately a pin, not an
-/// endorsement: when embedded fonts become supported this test must change with it.
+/// `%äüöß` second line, and two indirect `/Length` references. It pins three facts:
+/// the container parses such a file (the #646 fix), text extraction gets through
+/// the content layer (marked content and external graphics state), and the one
+/// embedded TrueType subset decodes through its `ToUnicode` CMap.
 #[test]
-fn libreoffice_export_parses_and_pins_the_next_content_gap() {
+fn libreoffice_export_parses_and_reads_its_text_layer() {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/libreoffice-export.pdf"
@@ -510,19 +509,16 @@ fn libreoffice_export_parses_and_pins_the_next_content_gap() {
         document.objects.len()
     );
 
-    // Remaining gap: the text layer uses an embedded TrueType subset, which this reader
-    // declines. Marked content (BMC/BDC/EMC) and `gs` no longer stop the scan.
+    // The embedded TrueType subset carries a ToUnicode CMap, and marked content
+    // (BMC/BDC/EMC) and `gs` no longer stop the scan, so the page reads completely.
     let output = read_pdf(&bytes).expect("the reader reports a status instead of failing");
-    assert_eq!(output["status"], "partial", "reader reported {output}");
-    assert_eq!(
-        output["error"]["code"], "UNSUPPORTED_DOCUMENT",
-        "reader reported {output}"
-    );
+    assert_eq!(output["status"], "completed", "reader reported {output}");
+    let text = output["items"][0]["text"]
+        .as_str()
+        .expect("the page must carry text")
+        .replace('\n', "");
     assert!(
-        output["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("font"),
-        "the pinned gap is the embedded font: {output}"
+        text.contains("Q3 Report"),
+        "the export must decode its embedded TrueType font, got {text:?}: {output}"
     );
 }
