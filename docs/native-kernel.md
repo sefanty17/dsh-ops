@@ -284,10 +284,13 @@ Each item is { page, text, runs: string[] }. Runs retain individual PDF text-sho
 operations; TJ spacing numbers are not characters. Text joins runs with newlines for
 display. Scope is page-text-layer-content-order, **not rendered reading order**.
 Excluded content is stated in every result: layout, images/OCR, annotations/form fields,
-attachments/metadata, and structure-tree alternate text. A page invoking unsupported
-forms/images, marked content or external graphics state is a gap, even when it also has
-supported text. Blank absent/null/empty/comment-only content yields an empty page;
-nonempty graphics without a supported text layer is explicitly unsupported.
+attachments/metadata, and structure-tree alternate text. The worker skips marked content
+(BMC/BDC/EMC) and graphics-state/colour operators (gs, g, G, rg, RG, k, K, sc, scn,
+SC, SCN) inside and outside text objects; they emit no glyphs and do not reorder runs,
+so they never create a gap. Pattern colours remain unsupported. A page invoking
+forms, images (XObject or inline) or shading is a gap, even when it also has supported
+text. Blank absent/null/empty/comment-only content yields an empty page; nonempty
+graphics without a supported text layer is explicitly unsupported.
 
 The supported text subset is PDF 1.3–1.7 with the foundation's classic xref container,
 standard Helvetica/Courier/Times Type1 families, built-in StandardEncoding printable

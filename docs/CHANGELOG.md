@@ -285,6 +285,10 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Read PDFs whose stream `/Length`, trailer `/Size` or page-tree `/Count` is an indirect
   reference: resolve the chain through the xref table with bounded hops and cycle detection
   instead of failing with "Expected a bounded nonnegative PDF integer".
+- Read PDF pages whose text is wrapped in marked content or preceded by graphics-state
+  operators: skip `BMC`/`BDC`/`EMC` and the graphics-state/colour operators that do not emit
+  glyphs, instead of failing the page. WPS and Chrome exports now reach the font layer rather
+  than an operator error; forms, inline images, shading and embedded fonts remain unsupported.
 - 切换离开已接入预设时撤回 PTC 发布并取消调用；保留其他会话的发现选择，外部调用仅在自有包装内授权一次。
 - 诊断所选发现/Shell 的服务与作用域发布，并说明无关预设嵌套时宿主继承祖先注册/限制的边界。
 - Plan only the new Agent on `agent/created` instead of re-reading every live session's tool
@@ -295,6 +299,9 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Agent，宿主未标注归属的变更合并为一次处理。新建会话不再随已开会话数线性扫描工具视图。
 - 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
   带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败。
+- 读取文本被标记内容包裹、或前置图形状态操作符的 PDF 页面：跳过 `BMC`/`BDC`/`EMC` 以及不产生
+  字形的图形状态/颜色操作符，不再整页失败。WPS 与 Chrome 导出的文件现在会进入字体层而非报操作符
+  错误；表单、内联图片、渐变与嵌入字体仍不支持。
 
 ## [0.5.0] — 2026-10-27 — Preset-mode component roster
 
