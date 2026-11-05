@@ -158,33 +158,43 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Read PDFs whose stream `/Length`, trailer `/Size` or page-tree `/Count` is an indirect
   reference: resolve the chain through the xref table with bounded hops and cycle detection
-  instead of failing with "Expected a bounded nonnegative PDF integer".
+  instead of failing with "Expected a bounded nonnegative PDF integer" (#646).
 - 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
-  带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败。
+  带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败（#646）。
 - Read PDF pages whose text is wrapped in marked content or preceded by graphics-state
   operators: skip the listed graphics-state and colour operators (`gs`, `g`/`G`, `rg`/`RG`,
   `k`/`K`, `sc`/`scn`/`SC`/`SCN`, `cs`/`CS`) and the marked-content operators
   (`BMC`/`BDC`/`EMC`, `MP`/`DP`), none of which emits a glyph, instead of failing the page.
-  WPS and Chrome exports now reach the font layer rather than an operator error; forms, inline
-  images and shading remain unsupported.
+  WPS and Firefox exports now reach the font layer rather than an operator error; forms, inline
+  images and shading remain unsupported. The bilingual PDF worker docs list the same operator
+  set (#646).
 - 读取文本被标记内容包裹、或前置图形状态操作符的 PDF 页面：跳过下列不产生字形的图形状态与颜色
   操作符（`gs`、`g`/`G`、`rg`/`RG`、`k`/`K`、`sc`/`scn`/`SC`/`SCN`、`cs`/`CS`）以及标记内容
-  操作符（`BMC`/`BDC`/`EMC`、`MP`/`DP`），不再整页失败。WPS 与 Chrome 导出的文件现在会进入
-  字体层而非报操作符错误；表单、内联图片与渐变仍不支持。
+  操作符（`BMC`/`BDC`/`EMC`、`MP`/`DP`），不再整页失败。WPS 与 Firefox 导出的文件现在会进入
+  字体层而非报操作符错误；表单、内联图片与渐变仍不支持。中英文 PDF worker 文档同步列出这组
+  操作符（#646）。
 - Read PDFs whose text layer uses an embedded or CID font: Type0/Identity-H/V fonts and simple
   fonts carrying a `ToUnicode` CMap now map character codes to Unicode, where only standard
   Type1 encodings were decoded before. Glyph programs, `DescendantFonts` and `CIDToGIDMap`
-  are never read.
+  are never read (#646).
 - 读取文本层使用嵌入字体或 CID 字体的 PDF：Type0/Identity-H/V 字体与带 `ToUnicode` CMap 的简单
   字体现在能把字符码映射为 Unicode，此前只解码标准 Type1 编码；字形程序、`DescendantFonts` 与
-  `CIDToGIDMap` 仍不读取。
+  `CIDToGIDMap` 仍不读取（#646）。
 - Read PDFs with a single modern cross-reference section: a cross-reference stream (`/Type /XRef`
   with `/W` and `/Index`) and object streams (`/Type /ObjStm`) are decoded into the bounded
   object table. Incremental PDFs stay refused: a trailer with `/Prev` or `/XRefStm` reports the
-  file as unsupported (#432).
+  file as unsupported (#432, #646).
 - 读取只有单个现代交叉引用区段的 PDF：xref 流（`/Type /XRef`，含 `/W`、`/Index`）与对象流
   （`/Type /ObjStm`）解码进同一张有界对象表；增量 PDF 仍被拒绝——trailer 含 `/Prev` 或
-  `/XRefStm` 即报告为不支持（#432）。
+  `/XRefStm` 即报告为不支持（#432、#646）。
+- Bound object-stream expansion and nested object reads: an indirect `/N`, `/First` or stream
+  `/Length` that reaches another stream now stops at 8 nested object-stream expansions or 64
+  nested object reads, and an object stream that names itself or its own compressed object is
+  refused as cyclic. Malformed files return `OUTPUT_LIMIT` or `DOCUMENT_PARSE_ERROR` instead of
+  overflowing the worker stack (#646).
+- 对象流展开与嵌套对象读取的递归现在有界：间接 `/N`、`/First` 或流 `/Length` 指向另一条流时，
+  最多连续展开 8 层对象流或 64 层嵌套对象读取；对象流指向自身或其内部压缩对象时按循环结构
+  拒绝。畸形文件返回 `OUTPUT_LIMIT` 或 `DOCUMENT_PARSE_ERROR`，不再造成 worker 栈溢出（#646）。
 
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 

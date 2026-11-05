@@ -1,6 +1,6 @@
-//! Producer-export fixtures: Chrome print-to-PDF, WPS Writer and Word 2021.
+//! Producer-export fixtures: Firefox print-to-PDF, WPS Writer and Word 2021.
 //!
-//! Chrome and WPS read end to end. Both embed Type0 Identity-H fonts whose
+//! Firefox and WPS read end to end. Both embed Type0 Identity-H fonts whose
 //! `ToUnicode` CMaps carry the Unicode text, and they show a few codes per `Tj`,
 //! so a line arrives as many runs. These tests pin the decoded text: a regression
 //! in the operator whitelist, the font layer or the container turns the text
@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 const FIXTURES: &str = "tests/fixtures";
-const CHROME: &str = "producer-chrome-print.pdf";
+const FIREFOX: &str = "producer-firefox-print.pdf";
 const WORD: &str = "producer-word2021.pdf";
 const WPS: &str = "producer-wps.pdf";
 
@@ -55,7 +55,7 @@ fn read_pdf(name: &str) -> Result<Value, Failure> {
 
 /// The single page's text with the run separators removed.
 ///
-/// Chrome and WPS show a few codes per `Tj`, so the reader reports many runs per
+/// Firefox and WPS show a few codes per `Tj`, so the reader reports many runs per
 /// line; joining them is the only way to compare the produced text with the
 /// document's words.
 fn page_text(name: &str, output: &Value) -> String {
@@ -89,10 +89,10 @@ fn assert_reads(name: &str, output: &Value, expected: &[&str]) {
 }
 
 #[test]
-fn chrome_print_export_decodes_its_type0_fonts() {
-    let output = read_pdf(CHROME).expect("Chrome print export must still parse its classic xref");
+fn firefox_print_export_decodes_its_type0_fonts() {
+    let output = read_pdf(FIREFOX).expect("Firefox print export must still parse its classic xref");
     // Type0 Identity-H fonts with a ToUnicode CMap, shown a few codes per `Tj`.
-    assert_reads(CHROME, &output, &["中文测试", "Q3 Report", "Gross margin 37.4"]);
+    assert_reads(FIREFOX, &output, &["中文测试", "Q3 Report", "Gross margin 37.4"]);
 }
 
 #[test]
@@ -144,15 +144,15 @@ fn contains_type(haystack: &[u8], kind: &str) -> bool {
 
 #[test]
 fn fixtures_keep_the_producer_container_structure() {
-    let chrome = raw(CHROME);
+    let firefox = raw(FIREFOX);
     assert!(
-        chrome.starts_with(b"%PDF-1.4"),
-        "Chrome print export must stay PDF 1.4 with a classic xref; header is {:?}",
-        String::from_utf8_lossy(&chrome[..16.min(chrome.len())])
+        firefox.starts_with(b"%PDF-1.4"),
+        "Firefox print export must stay PDF 1.4 with a classic xref; header is {:?}",
+        String::from_utf8_lossy(&firefox[..16.min(firefox.len())])
     );
     assert!(
-        !contains_type(&chrome, "ObjStm"),
-        "Chrome print export must stay free of object streams; a replaced fixture would change \
+        !contains_type(&firefox, "ObjStm"),
+        "Firefox print export must stay free of object streams; a replaced fixture would change \
          what the reader assertions cover"
     );
 

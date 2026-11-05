@@ -265,9 +265,11 @@ structure can carry it.
 
 Bounds are checked before indexed allocation: 16 MiB per input, 10,000 xref entries,
 100,000 metadata values, depth 64, 4,096 keys per dictionary, 4,096 objects per object
-stream, 256 bytes per name/token, 1 MiB per string or encoded/decoded stream, and 8 MiB of
-decoded xref and object streams. Reference chains have cycle detection and a depth bound, and
-the container has a 20-second deadline.
+stream, 256 bytes per name/token, 1 MiB per string or encoded/decoded stream, 8 MiB of
+decoded xref and object streams, 8 nested object-stream expansions and 64 nested object
+reads. Reference chains have cycle detection and a depth bound, and the container has a
+20-second deadline. An object stream that names itself or its own compressed object reports
+a cyclic-structure failure; a chain past either depth bound reports `OUTPUT_LIMIT`.
 Streams support no filter or one FlateDecode only; external streams, filter chains and
 DecodeParms are declined. Actual decompression stops at the decoded limit plus one byte and
 requires a valid checksum, zlib terminator and exact consumption of the input. No size
@@ -289,9 +291,9 @@ operations; TJ spacing numbers are not characters. Text joins runs with newlines
 display. Scope is page-text-layer-content-order, **not rendered reading order**.
 Excluded content is stated in every result: layout, images/OCR, annotations/form fields,
 attachments/metadata, and structure-tree alternate text. The worker skips marked content
-(BMC/BDC/EMC) and graphics-state/colour operators (gs, g, G, rg, RG, k, K, sc, scn,
-SC, SCN) inside and outside text objects; they emit no glyphs and do not reorder runs,
-so they never create a gap. Pattern colours remain unsupported. A page invoking
+(BMC/BDC/EMC, MP/DP) and graphics-state/colour operators (gs, g, G, rg, RG, k, K, sc, scn,
+SC, SCN, cs, CS) inside and outside text objects; they emit no glyphs and do not reorder
+runs, so they never create a gap. Pattern colours remain unsupported. A page invoking
 forms, images (XObject or inline) or shading is a gap, even when it also has supported
 text. Blank absent/null/empty/comment-only content yields an empty page; nonempty
 graphics without a supported text layer is explicitly unsupported.
@@ -309,8 +311,9 @@ and Annex D](https://developer.adobe.com/document-services/docs/assets/35e436906
 Physical scanning stops at 32 pages, 30 seconds, 1 MiB decoded content per page, 64
 content streams per page, 1 MiB text/10,000 runs per page, and 16 MiB aggregate decoded
 streams **and** 16 MiB processed stream bytes. Shared streams decode once but every
-reuse counts against processed work. The existing 16 MiB file and per-stream limits
-also apply. Page offsets do not bypass any physical bound.
+reuse counts against processed work; each `ToUnicode` table is decoded once per font
+object and charged to the aggregate decoded budget. The existing 16 MiB file and
+per-stream limits also apply. Page offsets do not bypass any physical bound.
 
 scanComplete concerns the entire bounded text scope; pageComplete concerns the
 requested page range and becomes false on file changes. pagesObserved and skipped
