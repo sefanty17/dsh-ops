@@ -191,9 +191,9 @@ impl<'a> Lexer<'a> {
     ///
     /// `/Prev` and `/XRefStm` only describe an incremental update while they are
     /// trailer keys, and an outline item legitimately carries `/Prev` as its
-    /// previous sibling. The container reads `/Prev`, `/XRefStm`, `/ObjStm` and
-    /// `/XRef` where they are meaningful (incremental chains, hybrid tables,
-    /// object and xref streams) instead of the lexer refusing them here.
+    /// previous sibling. The container refuses both in a trailer and reads
+    /// `/ObjStm` and `/XRef` as stream types instead of the lexer refusing the
+    /// tokens here.
     /// `/Encrypt` is the one name no supported structure can carry: every string
     /// and stream in an encrypted file is unreadable without the password.
     fn name(&mut self) -> Result<Vec<u8>> {

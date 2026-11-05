@@ -251,22 +251,23 @@ reference pages retains the declared main-body scope independently of stored-row
 
 ## PDF parser foundation (15c/16)
 
-The internal PDF container parser accepts a restricted PDF 1.0-1.7 subset: classic xref
-tables, cross-reference streams, object streams, incremental `/Prev` chains and hybrid
-`/XRefStm` tables, with an exact final startxref/EOF footer, unique dictionary keys and
-object identities. Stream `/Length`, trailer `/Size` and page-tree `/Count` may be indirect;
-the chain is resolved through the xref table with bounded hops and cycle detection. Every
-xref offset must point exactly at its section or object header, objects cannot overlap, and
-gaps must contain only whitespace or comments. Recovery scans, encryption and ambiguous
-duplicate data are refused. `/Prev` and `/XRefStm` denote an earlier xref section only as
-trailer keys, so an outline item's `/Prev` for its previous sibling is an ordinary key;
-`/Encrypt` alone is refused at the name token because no supported structure can carry it.
+The internal PDF container parser accepts a restricted PDF 1.0-1.7 subset: one classic xref
+table or one cross-reference stream, plus object streams, with an exact final startxref/EOF
+footer, unique dictionary keys and object identities. Stream `/Length`, trailer `/Size` and
+page-tree `/Count` may be indirect; the chain is resolved through the xref table with bounded
+hops and cycle detection. Every xref offset must point exactly at its section or object header,
+objects cannot overlap, and the header region before the first object holds only whitespace or
+comments. Recovery scans, encryption, ambiguous duplicate data and incremental updates are
+refused. A trailer key `/Prev` or `/XRefStm` names an earlier xref section, so the container
+reports it as unsupported instead of following it; an outline item's `/Prev` for its previous
+sibling is an ordinary key. `/Encrypt` alone is refused at the name token because no supported
+structure can carry it.
 
-Bounds are checked before indexed allocation: 16 MiB per input, 10,000 xref entries, a
-64-section `/Prev` chain, 100,000 metadata values, depth 64, 4,096 keys per dictionary,
-4,096 objects per object stream, 256 bytes per name/token, 1 MiB per string or
-encoded/decoded stream, and 8 MiB of decoded xref and object streams. Reference chains
-have cycle detection and a depth bound, and the container has a 20-second deadline.
+Bounds are checked before indexed allocation: 16 MiB per input, 10,000 xref entries,
+100,000 metadata values, depth 64, 4,096 keys per dictionary, 4,096 objects per object
+stream, 256 bytes per name/token, 1 MiB per string or encoded/decoded stream, and 8 MiB of
+decoded xref and object streams. Reference chains have cycle detection and a depth bound, and
+the container has a 20-second deadline.
 Streams support no filter or one FlateDecode only; external streams, filter chains and
 DecodeParms are declined. Actual decompression stops at the decoded limit plus one byte and
 requires a valid checksum, zlib terminator and exact consumption of the input. No size

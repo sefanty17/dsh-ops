@@ -77,17 +77,29 @@ fn duplicate_keys_and_escaped_unsupported_names_are_rejected() {
     }
     // `/Encrypt` is the only name the container cannot interpret at any level, and an escaped
     // spelling must decode to it before the check. `/Prev`, `/XRefStm`, `/ObjStm` and `/XRef` are
-    // ordinary names now: the container reads them where they are meaningful (incremental chains,
-    // hybrid trailers, object and xref streams) instead of the lexer refusing them wholesale.
+    // ordinary names: the container reads the last two as stream types and the first two only
+    // where a trailer is read.
     for name in ["Encrypt", "E#6ecrypt", "Enc#72ypt"] {
         rejected(
             &fixture(&[format!("<< /{name} null >>").as_bytes()]),
             "UNSUPPORTED_DOCUMENT",
         );
     }
+    // A trailer key is the one place either name means an earlier revision. The escaped spelling
+    // must decode before the check, and single-revision files with it are refused as incremental.
+    let pdf = fixture(&[b"<<>>"]);
+    for key in [b"/Prev".as_slice(), b"/Pr#65v", b"/XRefStm"] {
+        let mut trailer = b"/Root 1 0 R ".to_vec();
+        trailer.extend_from_slice(key);
+        trailer.extend_from_slice(b" 9 0 R >>");
+        rejected(
+            &replace(&pdf, b"/Root 1 0 R >>", &trailer),
+            "UNSUPPORTED_DOCUMENT",
+        );
+    }
 }
 #[test]
-fn outline_prev_is_an_ordinary_key_and_a_trailer_prev_is_a_chain() {
+fn outline_prev_is_an_ordinary_object_key() {
     // An outline item names its previous sibling with /Prev, which is not an
     // incremental-update marker; refusing the token made the whole document
     // unreadable (#427).
@@ -101,36 +113,7 @@ fn outline_prev_is_an_ordinary_key_and_a_trailer_prev_is_a_chain() {
     let document = parse(&pdf).unwrap();
     let second = document.object((5, 0)).unwrap().value.dict().unwrap();
     assert!(matches!(get(second, b"Prev").unwrap(), Value::Ref(4, 0)));
-    // A trailer `/Prev` is the earlier xref section, and this container follows it instead of
-    // refusing every incremental PDF: a second revision adds object 6 and links back to the
-    // first table.
-    let first = pdf.windows(7).position(|w| w == b"xref\n0 ").unwrap();
-    let mut incremental = pdf.clone();
-    let object = incremental.len();
-    incremental.extend_from_slice(b"6 0 obj\n(new)\nendobj\n");
-    let xref = incremental.len();
-    incremental.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n6 1\n");
-    incremental.extend_from_slice(format!("{object:010} 00000 n \n").as_bytes());
-    incremental.extend_from_slice(
-        format!(
-            "trailer\n<< /Size 7 /Root 1 0 R /Prev {first} >>\nstartxref\n{xref}\n%%EOF\n"
-        )
-        .as_bytes(),
-    );
-    let document = parse(&incremental).unwrap();
-    assert_eq!(document.objects.len(), 6);
-    assert!(document.object((6, 0)).is_ok());
-    // `/XRefStm` is read as an offset the same way rather than refused by name; this fixture has
-    // no cross-reference stream, so a trailer naming one is an ordinary parse error.
-    for key in [b"/Prev".as_slice(), b"/Pr#65v", b"/XRefStm"] {
-        let mut trailer = b"/Root 1 0 R ".to_vec();
-        trailer.extend_from_slice(key);
-        trailer.extend_from_slice(b" 9 0 R >>");
-        rejected(
-            &replace(&pdf, b"/Root 1 0 R >>", &trailer),
-            "DOCUMENT_PARSE_ERROR",
-        );
-    }
+    assert!(matches!(get(second, b"XRefStm").unwrap(), Value::Ref(4, 0)));
 }
 #[test]
 fn offset_alias_overlap_and_unindexed_data_are_never_recovered() {

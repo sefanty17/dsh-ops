@@ -167,9 +167,10 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   fonts carrying a `ToUnicode` CMap now map character codes to Unicode, where only standard
   Type1 encodings were decoded before. Glyph programs, `DescendantFonts` and `CIDToGIDMap`
   are never read.
-- Read PDFs with modern cross-reference structures: cross-reference streams (`/Type /XRef`
-  with `/W` and `/Index`), object streams (`/Type /ObjStm`), hybrid `/XRefStm` tables and
-  incremental `/Prev` chains are merged into one bounded table instead of refusing the file.
+- Read PDFs with a single modern cross-reference section: a cross-reference stream (`/Type /XRef`
+  with `/W` and `/Index`) and object streams (`/Type /ObjStm`) are decoded into the bounded
+  object table. Incremental PDFs stay refused: a trailer with `/Prev` or `/XRefStm` reports the
+  file as unsupported (#432).
 - 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
   带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败。
 - 读取文本被标记内容包裹、或前置图形状态操作符的 PDF 页面：跳过 `BMC`/`BDC`/`EMC` 以及不产生
@@ -178,8 +179,9 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - 读取文本层使用嵌入字体或 CID 字体的 PDF：Type0/Identity-H/V 字体与带 `ToUnicode` CMap 的简单
   字体现在能把字符码映射为 Unicode，此前只解码标准 Type1 编码；字形程序、`DescendantFonts` 与
   `CIDToGIDMap` 仍不读取。
-- 读取使用现代交叉引用结构的 PDF：xref 流（`/Type /XRef`，含 `/W`、`/Index`）、对象流
-  （`/Type /ObjStm`）、混合 `/XRefStm` 表与增量 `/Prev` 链合并为一张有界表，不再拒绝整份文件。
+- 读取只有单个现代交叉引用区段的 PDF：xref 流（`/Type /XRef`，含 `/W`、`/Index`）与对象流
+  （`/Type /ObjStm`）解码进同一张有界对象表；增量 PDF 仍被拒绝——trailer 含 `/Prev` 或
+  `/XRefStm` 即报告为不支持（#432）。
 
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 
@@ -354,13 +356,11 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Embed the complete frozen official Niubash v1.5.0 Windows x64 payload as the default shell backend; verify source and per-call execution trees, include preparation in cancellation/deadlines, preserve results on cleanup failure, and integrate managed install/status/select/removal. Missing payloads never switch implicitly to ambient Bash; explicit Git Bash and POSIX system Bash remain supported. This full-package-first choice does not rule out rubash-only later.
 - Windows x64 默认 Shell 改为固定官方 Niubash v1.5.0 完整载荷；校验源树及每调用执行树，准备阶段纳入取消/超时，清理失败不覆盖结果，并接通托管安装/状态/选择/卸载。缺载荷不隐式切换环境 Bash，保留显式 Git Bash 与 POSIX 系统 Bash。这是先完整包的阶段选择，不否定后续 rubash-only。
 
-- Let `/Prev` and `/XRefStm` be ordinary PDF dictionary keys: they mark an incremental
-  update only as trailer keys, so an outline item's `/Prev` no longer makes the whole
-  document unreadable (#427). The container follows that trailer `/Prev` chain and reads
-  incremental PDFs instead of refusing them.
-- 允许 `/Prev` 与 `/XRefStm` 作为普通 PDF 字典键：仅当它们出现在 trailer 中才表示增量更新，
-  大纲项里的 `/Prev` 不再使整份文档被判不可读（#427）。容器现在沿 trailer 的 `/Prev` 链读取
-  增量 PDF，而不是拒绝它们。
+- Let `/Prev` and `/XRefStm` be ordinary PDF dictionary keys: they mark an unsupported
+  incremental update only as trailer keys, so an outline item's `/Prev` no longer makes the
+  whole document unreadable (#427). A trailer that carries either key is still refused.
+- 允许 `/Prev` 与 `/XRefStm` 作为普通 PDF 字典键：仅当它们出现在 trailer 中才表示不支持的增量
+  更新，大纲项里的 `/Prev` 不再使整份文档被判不可读（#427）；trailer 携带其中任一键仍被拒绝。
 
 - Add current-scope `ops_status` diagnostics and public `diagnose(ctx, agent)` inspection; report integration, host/runtime, presentation and external provider readiness without executing or activating capabilities (#440).
 - 新增当前作用域 `ops_status` 与公开 `diagnose(ctx, agent)`，区分接入、宿主/运行时、展示及外部提供者状态，不执行或激活能力（#440）。

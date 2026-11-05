@@ -1,18 +1,17 @@
-//! Producer-export fixtures: Chrome print-to-PDF, Word 2021 and WPS Writer.
+//! Producer-export fixtures: Chrome print-to-PDF, WPS Writer and Word 2021.
 //!
-//! All three exports read end to end now. Chrome and WPS embed Type0 Identity-H
-//! fonts whose `ToUnicode` CMaps carry the Unicode text, and they show a few
-//! codes per `Tj`, so a line arrives as many runs. Word adds two simple TrueType
-//! subsets that declare `/WinAnsiEncoding` and no `ToUnicode`, which the reader
-//! decodes from the named encoding, next to two Type0 Identity fonts like the
-//! other producers. These tests pin the decoded text: a regression in the
-//! operator whitelist, the font layer or the container turns the text empty,
-//! partial or garbled rather than silently passing.
+//! Chrome and WPS read end to end. Both embed Type0 Identity-H fonts whose
+//! `ToUnicode` CMaps carry the Unicode text, and they show a few codes per `Tj`,
+//! so a line arrives as many runs. These tests pin the decoded text: a regression
+//! in the operator whitelist, the font layer or the container turns the text
+//! empty, partial or garbled rather than silently passing.
 //!
 //! The Word 2021 export is a hybrid-reference document with an incremental
 //! update: its final classic xref table is an empty `0 0` subsection, and the
 //! trailer's `/Prev` (previous classic xref) and `/XRefStm` (xref stream) hold the
-//! real object entries, one of which is a `/Type /ObjStm` container.
+//! real object entries, one of which is a `/Type /ObjStm` container. #432 keeps
+//! incremental PDFs unsupported, so the container refuses this export; the
+//! rejection test pins that as a product decision and its fonts stay unread.
 //!
 //! The final test guards the fixture bytes themselves, so a replaced sample can
 //! never silently change what the reader assertions mean.
@@ -110,22 +109,23 @@ fn wps_export_decodes_its_type0_fonts() {
 /// trailer's `/Prev 136746` (previous classic xref) and `/XRefStm 136356` (xref stream) hold the
 /// actual entries, and object 29 is a `/Type /ObjStm` container for objects 21..=54.
 ///
-/// Its four fonts decode through both supported simple paths: `/F1` and `/F2` are TrueType
-/// subsets with `/WinAnsiEncoding` and no `ToUnicode`, while `/F3` and `/F4` are Type0 Identity
-/// fonts with a `ToUnicode` CMap. The English runs therefore prove the named-encoding path and
-/// the Chinese runs prove the CMap path in one document.
+/// #432 keeps incremental updates unsupported, so the container stops at the empty subsection.
+/// This test pins the current gap as a product decision, not a bug to repair here: reading the
+/// export needs the incremental support that a separate change owns.
 #[test]
-fn word2021_export_parses_and_decodes_both_simple_font_paths() {
+fn word2021_incremental_export_is_rejected() {
     let bytes = raw(WORD);
-    let document = ops_documents::pdf_container::parse(&bytes)
-        .expect("the Word 2021 hybrid-reference incremental PDF must parse");
-    assert_eq!(
-        document.objects.len(),
-        68,
-        "every active object must load, including the objects expanded from the /Type /ObjStm"
+    let error = ops_documents::pdf_container::parse(&bytes)
+        .expect_err("an incremental PDF must be refused");
+    assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
+    assert!(
+        error.message.contains("subsection cannot be empty"),
+        "{}",
+        error.message
     );
-    let output = read_pdf(WORD).expect("the reader reports a status instead of failing");
-    assert_reads(WORD, &output, &["Q3 Report", "Gross margin 37.4", "中文测试"]);
+    // The tool path reports the same container failure instead of a partial read.
+    let error = read_pdf(WORD).expect_err("the reader must not return a partial Word result");
+    assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
 }
 
 /// True when `haystack` contains `needle`; PDF dictionary keys may be written
@@ -177,6 +177,10 @@ fn fixtures_keep_the_producer_container_structure() {
     assert!(
         contains_type(&word, "ObjStm") || contains_type(&word, "XRef"),
         "Word 2021 export must keep its object stream or xref stream; without either it no longer \
-         exercises the hybrid-reference container"
+         exercises the hybrid-reference container that the rejection test pins"
+    );
+    assert!(
+        contains(&word, b"/Prev"),
+        "Word 2021 export must keep its incremental /Prev trailer key"
     );
 }
