@@ -11,7 +11,11 @@
 //! refuses (#432): superseded object bytes stay in the file, so following the earlier section
 //! would be a different, unsupported format. Parsed object ranges must stay disjoint from each
 //! other and from the xref section.
+//!
+//! The sibling `pdf_xref` module decodes cross-reference stream and object stream bytes; this
+//! module owns the document frame around them: footer, classic tables, the loader and ranges.
 use crate::pdf_syntax::{Dict, Lexer, MAX_NODES, Value, bad, limit, unsupported, white};
+use crate::pdf_xref::{XrefStream, object_stream, xref_stream};
 use ops_protocol::{Failure, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -22,14 +26,11 @@ pub const MAX_STREAM: usize = 1024 * 1024;
 pub const MAX_DECODED: usize = 8 * 1024 * 1024;
 /// Objects one object stream may hold.
 pub const MAX_OBJECT_STREAM_OBJECTS: usize = 4096;
-/// Bytes of one `/W` field; every value of a PDF file below 2^32 fits four bytes.
-const MAX_FIELD: usize = 4;
-const MAX_ROW: usize = 3 * MAX_FIELD;
 const CONTAINER_DEADLINE: Duration = Duration::from_secs(20);
 pub type ObjectId = (u32, u16);
-/// One merged cross-reference entry.
+/// One cross-reference entry, from a classic table or a stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum XrefEntry {
+pub(crate) enum XrefEntry {
     /// Type 0: the object number is not in use.
     Free { generation: u16 },
     /// Type 1: an object header at a byte offset.
@@ -123,10 +124,10 @@ fn check_deadline(started: Instant) -> Result<()> {
     Ok(())
 }
 /// One parsed object, its value, and (for a stream) its exact encoded bytes.
-struct Raw<'a> {
-    value: Value,
-    stream: Option<&'a [u8]>,
-    end: usize,
+pub(crate) struct Raw<'a> {
+    pub(crate) value: Value,
+    pub(crate) stream: Option<&'a [u8]>,
+    pub(crate) end: usize,
     nodes: usize,
 }
 /// Read the object at `offset`, resolving `/Length` through `length`.
@@ -134,7 +135,7 @@ struct Raw<'a> {
 /// `/Length` is the only value read before the object is complete: a stream's extent fixes where
 /// its `endstream` must be, so the caller supplies the resolver for the table it already has.
 /// The header must start its own token: a byte inside a comment is never an object.
-fn read_object<'a>(
+pub(crate) fn read_object<'a>(
     data: &'a [u8],
     offset: usize,
     expected: Option<ObjectId>,
@@ -199,154 +200,12 @@ fn read_object<'a>(
         nodes: lexer.nodes,
     })
 }
-/// The cross-reference stream at `offset`: its entries, its dictionary, and the end of `endobj`.
-///
-/// A section's stream must be readable with a direct `/Length`; resolving a reference would need
-/// the very table this stream defines, so such a file is refused instead of guessed at.
-fn xref_stream(data: &[u8], offset: usize) -> Result<(Table, usize)> {
-    let mut direct = |value: &Value| {
-        value
-            .integer()
-            .map_err(|_| bad("PDF xref stream /Length must be a direct bounded integer"))
-    };
-    let raw = read_object(data, offset, None, &mut direct)?;
-    let object = Object {
-        value: raw.value,
-        stream: raw.stream,
-    };
-    let dict = object.value.dict()?;
-    if get(dict, b"Type")?.name()? != b"XRef" {
-        return Err(bad("PDF cross-reference stream must have Type /XRef"));
-    }
-    let decoded = decode(&object)?;
-    let Value::Dict(trailer) = object.value else {
-        return Err(bad("Expected a PDF dictionary"));
-    };
-    let entries = xref_entries(&trailer, &decoded)?;
-    Ok((Table { entries, trailer }, raw.end))
-}
-fn field(bytes: &[u8], widths: &[usize], index: usize) -> usize {
-    let begin: usize = widths[..index].iter().sum();
-    bytes[begin..begin + widths[index]]
-        .iter()
-        .fold(0usize, |value, byte| (value << 8) | *byte as usize)
-}
-/// Decode `/W` and `/Index` into bounded entries.
-fn xref_entries(dict: &Dict, decoded: &[u8]) -> Result<BTreeMap<usize, XrefEntry>> {
-    let size = get(dict, b"Size")?.integer()?;
-    if size > MAX_OBJECTS {
-        return Err(limit("PDF xref stream Size exceeds 10000 objects"));
-    }
-    let widths: Vec<usize> = match get(dict, b"W")? {
-        Value::Array(values) if values.len() == 3 => {
-            values.iter().map(Value::integer).collect::<Result<_>>()?
-        }
-        _ => return Err(bad("PDF xref stream W must be three bounded integers")),
-    };
-    if widths.iter().any(|width| *width > MAX_FIELD) {
-        return Err(limit("PDF xref stream field exceeds 4 bytes"));
-    }
-    let row: usize = widths.iter().sum();
-    if row == 0 || row > MAX_ROW {
-        return Err(bad("PDF xref stream entry has no bounded byte width"));
-    }
-    let ranges = match dict.get(b"Index".as_slice()) {
-        None => vec![(0usize, size)],
-        Some(value) => {
-            let Value::Array(values) = value else {
-                return Err(bad("PDF xref stream Index must be an array"));
-            };
-            if values.is_empty() || values.len() % 2 != 0 {
-                return Err(bad("PDF xref stream Index must hold offset/count pairs"));
-            }
-            values
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| Ok((pair[0].integer()?, pair[1].integer()?)))
-                .collect::<Result<Vec<_>>>()?
-        }
-    };
-    let mut total = 0usize;
-    for (start, count) in &ranges {
-        if *start >= MAX_OBJECTS || *count > MAX_OBJECTS - *start {
-            return Err(limit("PDF xref stream exceeds 10000 entries"));
-        }
-        total = total
-            .checked_add(*count)
-            .filter(|total| *total <= MAX_OBJECTS)
-            .ok_or_else(|| limit("PDF xref stream exceeds 10000 entries"))?;
-    }
-    let expected = total
-        .checked_mul(row)
-        .ok_or_else(|| limit("PDF xref stream exceeds 10000 entries"))?;
-    if decoded.len() != expected {
-        return Err(bad(
-            "PDF xref stream bytes disagree with its Size, Index and W",
-        ));
-    }
-    let mut entries: BTreeMap<usize, XrefEntry> = BTreeMap::new();
-    let mut at = 0;
-    for (start, count) in ranges {
-        for number in start..start + count {
-            let bytes = &decoded[at..at + row];
-            at += row;
-            // A zero-width type field means type 1, the most common entry.
-            let kind = if widths[0] == 0 { 1 } else { field(bytes, &widths, 0) };
-            let second = field(bytes, &widths, 1);
-            let third = field(bytes, &widths, 2);
-            let entry = match kind {
-                0 => {
-                    if third > u16::MAX as usize {
-                        return Err(bad("Invalid PDF xref stream free entry"));
-                    }
-                    XrefEntry::Free {
-                        generation: third as u16,
-                    }
-                }
-                1 => {
-                    if third >= u16::MAX as usize {
-                        return Err(bad("Invalid PDF xref stream in-use entry"));
-                    }
-                    XrefEntry::Offset {
-                        offset: second,
-                        generation: third as u16,
-                    }
-                }
-                2 => {
-                    if second >= size || third >= MAX_OBJECT_STREAM_OBJECTS {
-                        return Err(bad(
-                            "PDF xref stream compressed entry is outside its bounds",
-                        ));
-                    }
-                    XrefEntry::Compressed {
-                        stream: second as u32,
-                        index: third as u32,
-                    }
-                }
-                _ => {
-                    return Err(unsupported(
-                        "PDF xref stream entry types other than 0, 1 and 2 are unsupported",
-                    ));
-                }
-            };
-            if entries.insert(number, entry).is_some() {
-                return Err(bad("Duplicate PDF xref object number"));
-            }
-        }
-    }
-    Ok(entries)
-}
 /// The one cross-reference section the file names from its footer.
 struct Section {
     entries: BTreeMap<usize, XrefEntry>,
     trailer: Dict,
     /// True when this section is a cross-reference stream rather than a classic table.
     stream: bool,
-}
-struct Table {
-    entries: BTreeMap<usize, XrefEntry>,
-    trailer: Dict,
 }
 /// Refuse a trailer that names an earlier cross-reference section.
 ///
@@ -441,8 +300,12 @@ fn classic_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Se
     })
 }
 fn stream_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Section> {
-    let (table, end) = xref_stream(data, offset)?;
-    reject_incremental_trailer(&table.trailer)?;
+    let XrefStream {
+        entries,
+        trailer,
+        end,
+    } = xref_stream(data, offset)?;
+    reject_incremental_trailer(&trailer)?;
     let mut lexer = Lexer {
         data,
         at: end,
@@ -450,8 +313,8 @@ fn stream_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Sec
     };
     finish_section(&mut lexer, footer_start)?;
     Ok(Section {
-        entries: table.entries,
-        trailer: table.trailer,
+        entries,
+        trailer,
         stream: true,
     })
 }
@@ -617,57 +480,8 @@ impl<'a> Loader<'a> {
         if self.decoded > MAX_DECODED {
             return Err(limit("PDF decoded xref and object streams exceed 8 MiB"));
         }
-        if first > decoded.len() {
-            return Err(bad("PDF object stream First points outside its stream"));
-        }
-        let mut header = Lexer {
-            data: &decoded,
-            at: 0,
-            nodes: 0,
-        };
-        let mut pairs = Vec::with_capacity(count);
-        for _ in 0..count {
-            let number = header.unsigned()?;
-            let offset = header.unsigned()?;
-            if number >= MAX_OBJECTS {
-                return Err(limit(
-                    "PDF object stream names an object number at or above 10000",
-                ));
-            }
-            if offset > decoded.len() {
-                return Err(bad("PDF object stream entry offset is outside its stream"));
-            }
-            pairs.push((number, offset));
-        }
-        header.skip();
-        if header.at != first {
-            return Err(bad("PDF object stream header does not end at First"));
-        }
-        let mut values = Vec::with_capacity(count);
-        for (index, (number, offset)) in pairs.iter().enumerate() {
-            let at = first
-                .checked_add(*offset)
-                .filter(|at| *at < decoded.len())
-                .ok_or_else(|| bad("PDF object stream entry offset is outside its stream"))?;
-            let mut lexer = Lexer {
-                data: &decoded,
-                at,
-                nodes: 0,
-            };
-            let value = lexer.value(0)?;
-            let nodes = lexer.nodes;
-            lexer.skip();
-            let next = pairs
-                .get(index + 1)
-                .map_or(decoded.len(), |(_, offset)| first + offset);
-            if lexer.at != next {
-                return Err(bad(
-                    "PDF object stream entry does not end at the next entry offset",
-                ));
-            }
-            self.charge(nodes)?;
-            values.push((*number as u32, value));
-        }
+        let mut charge = |nodes: usize| self.charge(nodes);
+        let values = object_stream(&decoded, count, first, &mut charge)?;
         self.expanded.insert(stream, values);
         Ok(())
     }
