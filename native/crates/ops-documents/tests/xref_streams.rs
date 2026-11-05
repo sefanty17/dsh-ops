@@ -1,5 +1,5 @@
-//! Container coverage for single-section cross-reference streams and object streams, the two
-//! PDF 1.5+ structures that carry a cross-reference table or object bodies in a stream.
+//! Container and reader coverage for single-section cross-reference streams and object streams,
+//! the two PDF 1.5+ structures that carry a cross-reference table or object bodies in a stream.
 //!
 //! Every PDF here is assembled from emitted bytes, so each xref offset is the real one. The
 //! compressed streams use stored deflate blocks: integration tests cannot reach the crate's
@@ -9,10 +9,20 @@
 //! trailer `/Prev` or `/XRefStm` are asserted to be refused here, and the Word 2021 export that
 //! relies on them is pinned by `pdf_producer_samples`.
 use ops_documents::pdf_container::{get, parse};
+use ops_protocol::{Failure, Request};
+use serde_json::{Value, json};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 const CATALOG: &[u8] = b"<< /Type /Catalog /Pages 2 0 R >>";
 const PAGES: &[u8] = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
 const PAGE: &[u8] = b"<< /Type /Page /Parent 2 0 R >>";
+const PAGE_WITH_TEXT: &[u8] =
+    b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>";
+const CONTENT: &[u8] = b"BT /F1 12 Tf (Hello) Tj ET";
+const FONT: &[u8] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
 
 /// Adler-32 of a zlib trailer.
 fn adler32(data: &[u8]) -> u32 {
@@ -139,14 +149,12 @@ fn xref_stream_document(dict: &str, rows: &[[u8; 7]]) -> Vec<u8> {
     pdf.bytes
 }
 
-/// A one-page document whose only cross-reference section is a Flate xref stream covering
-/// objects 0..=4, including the stream object itself. `extra` appends trailer keys.
-fn flate_xref_stream_document(extra: &str) -> Vec<u8> {
-    let mut pdf = Pdf::new();
-    pdf.object(CATALOG);
-    pdf.object(PAGES);
-    pdf.object(PAGE);
+/// Close `pdf` with the only cross-reference section it gets: a Flate xref stream covering every
+/// object written so far plus the stream object itself. `extra` appends trailer keys.
+fn with_flate_xref(mut pdf: Pdf, extra: &str) -> Vec<u8> {
     let stream_offset = pdf.bytes.len();
+    // The free entry plus one offset row per written object, plus this stream's own row.
+    let size = pdf.offsets.len() + 2;
     let mut rows = vec![row(0, 0, 65_535)];
     for offset in &pdf.offsets {
         rows.push(row(1, *offset as u32, 0));
@@ -154,12 +162,93 @@ fn flate_xref_stream_document(extra: &str) -> Vec<u8> {
     rows.push(row(1, stream_offset as u32, 0));
     let decoded: Vec<u8> = rows.iter().flatten().copied().collect();
     pdf.stream(
-        &format!("/Type /XRef /Size 5 /W [1 4 2] /Index [0 5] /Root 1 0 R {extra}"),
+        &format!("/Type /XRef /Size {size} /W [1 4 2] /Index [0 {size}] /Root 1 0 R {extra}"),
         &decoded,
     );
     pdf.bytes
         .extend_from_slice(format!("startxref\n{stream_offset}\n%%EOF\n").as_bytes());
     pdf.bytes
+}
+
+/// A one-page document whose only cross-reference section is a Flate xref stream covering
+/// objects 0..=4, including the stream object itself. `extra` appends trailer keys.
+fn flate_xref_stream_document(extra: &str) -> Vec<u8> {
+    let mut pdf = Pdf::new();
+    pdf.object(CATALOG);
+    pdf.object(PAGES);
+    pdf.object(PAGE);
+    with_flate_xref(pdf, extra)
+}
+
+/// A one-page document whose only cross-reference section is a Flate xref stream and whose page
+/// carries a text layer: the reader must resolve the stream before it can show any text.
+///
+/// Objects 1-5 are classic, so this is the shape a PDF 1.5+ writer produces for a Word-like
+/// export: a page tree in the object section and the index in a stream.
+fn xref_stream_text_document() -> Vec<u8> {
+    let mut pdf = Pdf::new();
+    pdf.object(CATALOG); // 1
+    pdf.object(PAGES); // 2
+    pdf.object(PAGE_WITH_TEXT); // 3
+    let mut content = format!("<< /Length {} >>\nstream\n", CONTENT.len()).into_bytes();
+    content.extend_from_slice(CONTENT);
+    content.extend_from_slice(b"\nendstream");
+    pdf.object(&content); // 4
+    pdf.object(FONT); // 5
+    with_flate_xref(pdf, "")
+}
+
+/// Scratch directory Cargo creates for integration tests. The system temp directory is not
+/// writable in every environment.
+fn scratch_dir() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&dir).expect("create scratch directory");
+    dir
+}
+
+/// One PDF on disk; removed when the test ends, including on panic.
+struct TempPdf(PathBuf);
+
+impl TempPdf {
+    fn write(bytes: &[u8]) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = scratch_dir().join(format!(
+            "xref-stream-{}-{}.pdf",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).expect("write temporary PDF");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempPdf {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Run the public `read_pdf` tool over `bytes`, exactly as the worker dispatch does.
+fn read_pdf(bytes: &[u8]) -> Result<Value, Failure> {
+    let temp = TempPdf::write(bytes);
+    let path = temp.path();
+    let root = path
+        .parent()
+        .expect("scratch directory")
+        .to_string_lossy()
+        .into_owned();
+    let request: Request = serde_json::from_value(json!({
+        "root": root,
+        "scope": "xref-stream",
+        "tool": "read_pdf",
+        "args": { "path": path.to_string_lossy() },
+    }))
+    .expect("worker request");
+    ops_documents::dispatch(&request)
 }
 
 #[test]
@@ -194,6 +283,23 @@ fn xref_stream_bytes_must_match_its_size_index_and_w() {
 #[test]
 fn truncated_and_mutated_xref_stream_documents_never_panic() {
     let pdf = flate_xref_stream_document("");
+    // The unmodified document is the baseline every header mutation below must preserve.
+    let baseline = parse(&pdf).expect("the baseline document must parse");
+    assert_eq!(baseline.objects.len(), 4);
+    assert_eq!(baseline.root, (1, 0));
+    // Bytes 10..14 are the binary marker on the header's second line, which is a comment: no
+    // structure depends on them, so changing them must still parse to the same document. This
+    // keeps the mutation sweep below from accepting a parser that simply rejects every change.
+    assert_eq!(&pdf[..15], b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
+    for at in 10..14 {
+        for byte in [0u8, b'%', b'<', b'9', 0xff] {
+            let mut changed = pdf.clone();
+            changed[at] = byte;
+            let document = parse(&changed).expect("a header comment byte must not decide a parse");
+            assert_eq!(document.objects.len(), baseline.objects.len());
+            assert_eq!(document.root, baseline.root);
+        }
+    }
     for end in 0..pdf.len() {
         let _ = parse(&pdf[..end]);
     }
@@ -276,6 +382,30 @@ fn xref_stream_with_w_index_and_flate_entries_is_used() {
             .name()
             .expect("name"),
         b"XRef"
+    );
+}
+
+/// The reader path, not only the container: a legal xref-stream document must reach `read_pdf`
+/// and produce its page text.
+///
+/// Every other test here stops at `pdf_container::parse`; the reader additionally walks the page
+/// tree, decodes the content stream and builds the font decoder.
+#[test]
+fn xref_stream_document_reads_its_text_through_read_pdf() {
+    let pdf = xref_stream_text_document();
+    let output = read_pdf(&pdf).expect("an xref-stream PDF must read");
+    assert_eq!(output["status"], "completed", "reader reported {output}");
+    assert_eq!(output["total"], 1, "reader reported {output}");
+    assert_eq!(output["pagesObserved"], 1, "reader reported {output}");
+    assert_eq!(output["items"][0]["page"], 1, "reader reported {output}");
+    assert_eq!(
+        output["items"][0]["text"], "Hello",
+        "reader reported {output}"
+    );
+    assert_eq!(
+        output["items"][0]["runs"],
+        json!(["Hello"]),
+        "reader reported {output}"
     );
 }
 
