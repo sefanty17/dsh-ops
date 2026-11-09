@@ -170,9 +170,11 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败（#646）。
 - Read PDFs with modern cross-reference structures: a cross-reference stream (`/Type /XRef` with
   `/W` and `/Index`) and object streams (`/Type /ObjStm`) are decoded into the bounded object
-  table (#432, #646).
+  table, and incremental updates are followed through a `/Prev` chain, including a hybrid
+  `/XRefStm` companion table, up to 64 sections merged newest first (#432, #646).
 - 读取采用现代交叉引用结构的 PDF：xref 流（`/Type /XRef`，含 `/W`、`/Index`）与对象流
-  （`/Type /ObjStm`）解码进同一张有界对象表（#432、#646）。
+  （`/Type /ObjStm`）解码进同一张有界对象表；增量更新沿 `/Prev` 链读取（含 hybrid `/XRefStm`
+  伴随表），最多 64 个区段、按最新优先合并（#432、#646）。
 - Bound object-stream expansion and nested object reads: an indirect `/N`, `/First` or stream
   `/Length` that reaches another stream now stops at 8 nested object-stream expansions or 64
   nested object reads, and an object stream that names itself or its own compressed object is
@@ -181,6 +183,13 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - 对象流展开与嵌套对象读取的递归现在有界：间接 `/N`、`/First` 或流 `/Length` 指向另一条流时，
   最多连续展开 8 层对象流或 64 层嵌套对象读取；对象流指向自身或其内部压缩对象时按循环结构
   拒绝。畸形文件返回 `OUTPUT_LIMIT` 或 `DOCUMENT_PARSE_ERROR`，不再造成 worker 栈溢出（#646）。
+- Restore Flate stream predictors: `/DecodeParms` Predictor 2 (TIFF) and 10-15 (PNG) rows are
+  undone from `/Columns`, `/Colors` and an 8-bit `/BitsPerComponent`, so xref streams and object
+  streams written by producers that predict their rows are read; another predictor, decode
+  parameter or parameter array is refused (#646).
+- 还原 Flate 流 predictor：按 `/Columns`、`/Colors` 与 8 位 `/BitsPerComponent` 反解
+  `/DecodeParms` 的 Predictor 2（TIFF）与 10–15（PNG）行，因此按行预测写出的 xref 流与对象流
+  也能读取；其它 predictor、解码参数或参数数组仍被拒绝（#646）。
 
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 
@@ -355,10 +364,13 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Embed the complete frozen official Niubash v1.5.0 Windows x64 payload as the default shell backend; verify source and per-call execution trees, include preparation in cancellation/deadlines, preserve results on cleanup failure, and integrate managed install/status/select/removal. Missing payloads never switch implicitly to ambient Bash; explicit Git Bash and POSIX system Bash remain supported. This full-package-first choice does not rule out rubash-only later.
 - Windows x64 默认 Shell 改为固定官方 Niubash v1.5.0 完整载荷；校验源树及每调用执行树，准备阶段纳入取消/超时，清理失败不覆盖结果，并接通托管安装/状态/选择/卸载。缺载荷不隐式切换环境 Bash，保留显式 Git Bash 与 POSIX 系统 Bash。这是先完整包的阶段选择，不否定后续 rubash-only。
 
-- Let `/Prev` and `/XRefStm` be ordinary PDF dictionary keys: they mark an unsupported
-  incremental update only as trailer keys, so an outline item's `/Prev` no longer makes the
-  whole document unreadable (#427).
-- 允许 `/Prev` 与 `/XRefStm` 作为普通 PDF 字典键：仅当它们出现在 trailer 中才表示不支持的增量更新，大纲项里的 `/Prev` 不再使整份文档被判不可读（#427）。
+- Let `/Prev` and `/XRefStm` be ordinary PDF dictionary keys: they mean another cross-reference
+  section only as trailer keys, so an outline item's `/Prev` no longer makes the
+  whole document unreadable (#427). A trailer that carries either key is now followed as an
+  incremental update instead of being refused.
+- 允许 `/Prev` 与 `/XRefStm` 作为普通 PDF 字典键：仅当它们出现在 trailer 中才表示指向另一个 xref
+  区段，大纲项里的 `/Prev` 不再使整份文档被判不可读（#427）；trailer 携带其中任一键时改为按增量
+  更新继续跟随，不再被拒绝。
 
 - Add current-scope `ops_status` diagnostics and public `diagnose(ctx, agent)` inspection; report integration, host/runtime, presentation and external provider readiness without executing or activating capabilities (#440).
 - 新增当前作用域 `ops_status` 与公开 `diagnose(ctx, agent)`，区分接入、宿主/运行时、展示及外部提供者状态，不执行或激活能力（#440）。

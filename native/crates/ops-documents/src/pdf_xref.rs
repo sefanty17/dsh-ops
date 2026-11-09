@@ -1,32 +1,24 @@
-//! Cross-reference streams and object streams: the two PDF 1.5+ structures that carry container
-//! metadata inside a Flate stream.
-//!
-//! [`crate::pdf_container`] owns the document frame: the footer, the single classic or stream
-//! cross-reference section, object reads, the loader and range verification. This module owns
-//! only the decoding of the two stream types that section delegates to it — the `/Type /XRef`
-//! stream that spells a cross-reference section and its trailer, and the `/Type /ObjStm` payload
-//! that holds inner object values. Both decoders are pure over bytes the caller already bounded;
-//! file-level budgets, the deadline and the decoded-byte accounting stay with the caller.
+//! Cross-reference stream and object stream decoding, pure over bytes the caller already bounded.
 use crate::pdf_container::{
     MAX_OBJECT_STREAM_OBJECTS, MAX_OBJECTS, Object, XrefEntry, decode, get, read_object,
 };
 use crate::pdf_syntax::{Dict, Lexer, Value, bad, limit, unsupported};
 use ops_protocol::Result;
-use std::collections::BTreeMap;
-/// Bytes of one `/W` field; every value of a PDF file below 2^32 fits four bytes.
+use std::collections::{BTreeMap, BTreeSet};
+/// Bytes of one /W field; every value of a PDF file below 2^32 fits four bytes.
 const MAX_FIELD: usize = 4;
 const MAX_ROW: usize = 3 * MAX_FIELD;
-/// One decoded cross-reference stream: its section entries, trailer and end of `endobj`.
+/// One decoded cross-reference stream: its section entries, trailer and end of endobj.
 pub(crate) struct XrefStream {
     pub(crate) entries: BTreeMap<usize, XrefEntry>,
     pub(crate) trailer: Dict,
-    /// Byte just after the stream's `endobj`.
+    /// Byte just after the stream's endobj.
     pub(crate) end: usize,
+    /// Decoded payload bytes, which the caller charges to the shared decoded-stream budget.
+    pub(crate) decoded: usize,
 }
-/// The cross-reference stream at `offset`: its entries, its dictionary, and the end of `endobj`.
-///
-/// The section's stream must be readable with a direct `/Length`; resolving a reference would
-/// need the very table this stream defines, so such a file is refused instead of guessed at.
+/// The cross-reference stream at offset: its entries, its dictionary, and the end of endobj.
+/// Its /Length must be direct, because resolving one needs the table this stream defines.
 pub(crate) fn xref_stream(data: &[u8], offset: usize) -> Result<XrefStream> {
     let mut direct = |value: &Value| {
         value
@@ -46,11 +38,12 @@ pub(crate) fn xref_stream(data: &[u8], offset: usize) -> Result<XrefStream> {
     let Value::Dict(trailer) = object.value else {
         return Err(bad("Expected a PDF dictionary"));
     };
-    let entries = xref_entries(&trailer, &decoded)?;
+    let entries = xref_entries(data, &trailer, &decoded)?;
     Ok(XrefStream {
         entries,
         trailer,
         end: raw.end,
+        decoded: decoded.len(),
     })
 }
 fn field(bytes: &[u8], widths: &[usize], index: usize) -> usize {
@@ -59,10 +52,16 @@ fn field(bytes: &[u8], widths: &[usize], index: usize) -> usize {
         .iter()
         .fold(0usize, |value, byte| (value << 8) | *byte as usize)
 }
-/// Decode `/W` and `/Index` into bounded entries.
-fn xref_entries(dict: &Dict, decoded: &[u8]) -> Result<BTreeMap<usize, XrefEntry>> {
-    let size = get(dict, b"Size")?.integer()?;
-    if size > MAX_OBJECTS {
+/// Decode /W and /Index into bounded entries, then read the /Size that bounds them; a stream
+/// without /Index takes its row count from the payload, equal to the default [0 Size].
+fn xref_entries(data: &[u8], dict: &Dict, decoded: &[u8]) -> Result<BTreeMap<usize, XrefEntry>> {
+    let size_value = get(dict, b"Size")?;
+    let direct_size = match size_value {
+        Value::Integer(_) => Some(size_value.integer()?),
+        Value::Ref(..) => None,
+        _ => return Err(bad("PDF xref stream Size must be a bounded integer")),
+    };
+    if direct_size.is_some_and(|size| size > MAX_OBJECTS) {
         return Err(limit("PDF xref stream Size exceeds 10000 objects"));
     }
     let widths: Vec<usize> = match get(dict, b"W")? {
@@ -78,8 +77,20 @@ fn xref_entries(dict: &Dict, decoded: &[u8]) -> Result<BTreeMap<usize, XrefEntry
     if row == 0 || row > MAX_ROW {
         return Err(bad("PDF xref stream entry has no bounded byte width"));
     }
-    let ranges = match dict.get(b"Index".as_slice()) {
-        None => vec![(0usize, size)],
+    let (ranges, derived_size) = match dict.get(b"Index".as_slice()) {
+        None => match direct_size {
+            Some(size) => (vec![(0usize, size)], None),
+            None => {
+                // The default /Index [0 Size] makes the payload exactly Size rows of row bytes.
+                if !decoded.len().is_multiple_of(row) {
+                    return Err(bad(
+                        "PDF xref stream bytes disagree with its Size, Index and W",
+                    ));
+                }
+                let size = decoded.len() / row;
+                (vec![(0usize, size)], Some(size))
+            }
+        },
         Some(value) => {
             let Value::Array(values) = value else {
                 return Err(bad("PDF xref stream Index must be an array"));
@@ -87,12 +98,13 @@ fn xref_entries(dict: &Dict, decoded: &[u8]) -> Result<BTreeMap<usize, XrefEntry
             if values.is_empty() || values.len() % 2 != 0 {
                 return Err(bad("PDF xref stream Index must hold offset/count pairs"));
             }
-            values
+            let ranges = values
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|pair| Ok((pair[0].integer()?, pair[1].integer()?)))
-                .collect::<Result<Vec<_>>>()?
+                .collect::<Result<Vec<_>>>()?;
+            (ranges, None)
         }
     };
     let mut total = 0usize;
@@ -146,7 +158,7 @@ fn xref_entries(dict: &Dict, decoded: &[u8]) -> Result<BTreeMap<usize, XrefEntry
                     }
                 }
                 2 => {
-                    if second >= size || third >= MAX_OBJECT_STREAM_OBJECTS {
+                    if third >= MAX_OBJECT_STREAM_OBJECTS {
                         return Err(bad(
                             "PDF xref stream compressed entry is outside its bounds",
                         ));
@@ -167,14 +179,76 @@ fn xref_entries(dict: &Dict, decoded: &[u8]) -> Result<BTreeMap<usize, XrefEntry
             }
         }
     }
+    let size = size_of(data, &entries, size_value)?;
+    if size > MAX_OBJECTS {
+        return Err(limit("PDF xref stream Size exceeds 10000 objects"));
+    }
+    if derived_size.is_some_and(|derived| derived != size) {
+        return Err(bad("PDF xref stream Size disagrees with its default Index"));
+    }
+    for entry in entries.values() {
+        if let XrefEntry::Compressed { stream, .. } = entry
+            && *stream as usize >= size
+        {
+            return Err(bad(
+                "PDF xref stream compressed entry is outside its bounds",
+            ));
+        }
+    }
     Ok(entries)
 }
-/// Parse the decoded payload of one `/Type /ObjStm` stream into its inner objects.
-///
-/// `count` is the stream's `/N` and `first` its `/First`: the header before `first` pairs each
-/// object number with its offset from `first`, and every value must end at the next pair's
-/// offset. Each parsed value is charged through `charge`, so the caller keeps one metadata
-/// budget across every expanded stream.
+/// Resolve a cross-reference stream's /Size through the entries it declares; the named object
+/// must be uncompressed, because expanding one needs the document frame this section defines.
+fn size_of(data: &[u8], entries: &BTreeMap<usize, XrefEntry>, value: &Value) -> Result<usize> {
+    if !matches!(value, Value::Ref(..)) {
+        return value.integer();
+    }
+    let mut current = value.clone();
+    let mut seen = BTreeSet::new();
+    loop {
+        match current {
+            Value::Integer(_) => return current.integer(),
+            Value::Ref(number, generation) => {
+                if seen.len() >= 64 {
+                    return Err(limit("PDF reference chain exceeds 64"));
+                }
+                if !seen.insert((number, generation)) {
+                    return Err(bad("Cyclic PDF reference"));
+                }
+                let entry = *entries.get(&(number as usize)).ok_or_else(|| {
+                    bad("PDF xref stream Size reference does not name an object in its section")
+                })?;
+                let XrefEntry::Offset {
+                    offset,
+                    generation: active,
+                } = entry
+                else {
+                    return Err(bad(
+                        "PDF xref stream Size reference must name an uncompressed object",
+                    ));
+                };
+                if active != generation {
+                    return Err(bad(
+                        "PDF reference generation is not the active xref entry",
+                    ));
+                }
+                let mut direct = |value: &Value| value.integer();
+                let raw = read_object(data, offset, Some((number, generation)), &mut direct)?;
+                if raw.stream.is_some() {
+                    return Err(bad("PDF /Size must be a direct integer"));
+                }
+                current = raw.value;
+            }
+            _ => {
+                return Err(bad(
+                    "PDF indirect integer must reference a direct integer object",
+                ));
+            }
+        }
+    }
+}
+/// Parse the decoded payload of one /Type /ObjStm stream; count is /N and first is /First, and
+/// each value is charged through charge so the caller keeps one metadata budget across streams.
 pub(crate) fn object_stream(
     decoded: &[u8],
     count: usize,
