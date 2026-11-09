@@ -36,8 +36,9 @@ fn image() -> Vec<u8> {
 
 fn failed(bytes: &[u8], code: &str) -> String {
     let output = read(bytes, json!({})).expect("read_pdf returns an observation");
-    assert_eq!(output["status"], "partial", "{output}");
+    assert_eq!(output["status"], "error", "{output}");
     assert_eq!(output["error"]["code"], code, "{output}");
+    assert_eq!(output["failedPages"][0]["code"], code, "{output}");
     output["error"]["message"].as_str().expect("failure message").to_owned()
 }
 

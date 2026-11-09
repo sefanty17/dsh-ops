@@ -60,6 +60,18 @@ await test('search gaps never claim completed coverage or invent resumable scan 
   assert.equal(page.status, 'partial'); assert.equal(page.coverage.matchedCount, 8)
   assert.deepEqual(decodeContinuation(page.continuation).args, { pattern: 'x', glob: ['*.ts'], continuation: 'stable', offset: 8 })
 })
+await test('a page-limited PDF keeps its physical bound instead of suggesting a narrower request', () => {
+  const data = { status: 'completed', complete: false, scanComplete: false, pageComplete: true, pagesObserved: 32,
+    truncated: true, truncatedBy: 'page-limit', items: [{ page: 1, text: 'first', runs: ['first'] }] }
+  const out = toOutcome('read_pdf', { path: '/a.pdf', limit: 1 }, data)
+  assert.equal(out.status, 'error'); assert.equal(out.error.code, 'RESULT_PARTIAL'); assert.equal(out.data, data)
+  assert.match(out.error.message, /32-page physical read limit/); assert.match(out.error.message, /dedicated PDF reader/)
+  assert.equal('continuation' in out, false)
+  // A stored reference still lends a real cursor, and its coverage names the physical cause.
+  const spilled = toOutcome('read_pdf', { path: '/a.pdf', limit: 1 }, { ...data, reference: { refId: 'ref://s/read_pdf/x' }, referenceRoot: '/r' })
+  assert.equal(spilled.status, 'partial'); assert.equal(spilled.coverage.truncatedBy, 'page-limit'); assert.equal(spilled.coverage.isComplete, false)
+  assert.equal(decodeContinuation(spilled.continuation).tool, 'result')
+})
 await test('reference retrieval preserves original root and never resumes the producing mutation', () => {
   const data = { status: 'completed', changed: 3, complete: false, referenceRoot: '/original', reference: { refId: 'ref://s/replace/x' }, storageError: { code: 'QUOTA_EXCEEDED', effectState: 'applied' } }
   const out = toOutcome('replace', { pattern: 'x', replacement: 'y' }, data)

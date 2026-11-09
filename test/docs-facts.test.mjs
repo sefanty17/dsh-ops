@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getEncoding } from 'js-tiktoken'
 import { CAPABILITIES, FILE_TOOLS, capability } from '../lib/capabilities/registry.js'
+import { DOCUMENT_DESCRIPTIONS } from '../lib/capabilities/documents.js'
 import { DISCOVERY_TERMS } from '../lib/capabilities/discovery.js'
 import { publicToolName } from '../lib/policy.js'
 import { assert, test, report, PACKAGE_ROOT } from './lib/harness.mjs'
@@ -64,6 +65,60 @@ await test('the documented always-loaded document trio cost matches the catalogu
   const measured = `${getEncoding('cl100k_base').encode(wire).length} tokens / ${Buffer.byteLength(wire)}`
   for (const file of ['docs/discovery.md', 'docs/工具发现.md']) {
     assert.ok(read(file).includes(measured), `${file} no longer states the measured ${measured} for the trio`)
+  }
+})
+
+// The description routes the model: the old "Type1 ... only" sentence made real WPS,
+// Chrome and LibreOffice files look unsupported. Pin the features it must advertise, the
+// exclusive claim it must never regain, and the two behaviours that must not regress into
+// refusals — incremental updates and the 32-page truncation; reading the catalogue keeps
+// this off a copy.
+await test('the read_pdf description advertises the implemented PDF layer, not the old exclusive claim', () => {
+  const description = DOCUMENT_DESCRIPTIONS.read_pdf
+  assert.doesNotMatch(description, /Restricted classic-xref/u)
+  assert.doesNotMatch(description, /Standard\/WinAnsi encoding only/u)
+  assert.doesNotMatch(description, /\bonly\b[^.]*\bType1\b|\bType1\b[^.]*\bonly\b/iu)
+  assert.doesNotMatch(description, /Rejects[^.]*incremental/iu)
+  assert.match(description, /embedded/iu)
+  assert.match(description, /ToUnicode/u)
+  assert.match(description, /object streams?|objstm/u)
+  assert.match(description, /xref stream/iu)
+  assert.match(description, /page-limit/u)
+  // The argument names sit at the start so a first call reads them before guessing `pages`,
+  // `maxPages` or `file_path`, which the tool rejects as INVALID_ARGUMENT.
+  assert.match(description, /Arguments: path, optional offset \(1-32\), optional limit \(1-32\)\./u)
+  // Per-page failures are window-scoped: the description must name the report and say that a page
+  // outside the requested window cannot change the observation.
+  assert.match(description, /failedPages/u)
+  assert.match(description, /outside it|outside the (?:requested )?window/iu)
+})
+
+// The old descriptions called forms and pattern colours unsupported, which contradicted the
+// reader and the native-kernel docs. Pin the implemented behaviour in both directions: the terms
+// must be present, and the stale refusals must not come back in any current doc.
+await test('the read_pdf description and docs describe form traversal and pattern skips, not refusals', () => {
+  const description = DOCUMENT_DESCRIPTIONS.read_pdf
+  assert.match(description, /form XObjects reached by Do are traversed/iu)
+  assert.match(description, /pattern colours are validated then skipped/iu)
+  assert.match(description, /status is the window verdict/iu)
+  // The implemented wording is pinned per file: the kernel docs carry the content-order traversal
+  // and the budget charge, and the one-line references carry the short traversal and exclusion.
+  const stated = {
+    'docs/native-kernel.md': ['traversed in content order', 'charged to the 16 MiB aggregate', 'tiling pattern'],
+    'docs/原生内核.md': ['按内容顺序展开', '16 MiB', '平铺图案'],
+    'docs/component-reference.md': ['traverses form XObjects reached by `Do`', 'tiling patterns'],
+    'docs/组件参考.md': ['Form XObject 按内容顺序展开', '平铺图案'],
+  }
+  for (const [file, anchors] of Object.entries(stated)) {
+    const text = read(file)
+    for (const anchor of anchors) assert.ok(text.includes(anchor), `${file} lost "${anchor}"`)
+  }
+  for (const file of ['docs/native-kernel.md', 'docs/原生内核.md', 'docs/component-reference.md', 'docs/组件参考.md', 'docs/discovery.md', 'docs/工具发现.md']) {
+    const text = read(file)
+    assert.doesNotMatch(text, /\bforms?\b[^.]*\brejected\b/iu, `${file} calls forms rejected`)
+    assert.doesNotMatch(text, /pattern colou?rs?[^.]*\bunsupported\b/iu, `${file} calls pattern colours unsupported`)
+    assert.doesNotMatch(text, /Form XObjects?[^.]*\bunsupported\b/iu, `${file} calls form XObjects unsupported`)
+    assert.doesNotMatch(text, /图案颜色[^。]*不支持/u, `${file} calls pattern colours unsupported`)
   }
 })
 

@@ -2,12 +2,20 @@
 type Row = Record<string, unknown>
 const object = (value: unknown): value is Row => !!value && typeof value === 'object' && !Array.isArray(value)
 const show = (value: unknown): string => (JSON.stringify(value) ?? 'null').replace(/[\u0085\u2028\u2029]/gu, char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0'))
+const clip = (value: string, limit: number): string => {
+  const chars = Array.from(value)
+  return chars.length > limit ? chars.slice(0, limit - 1).join('') + '…' : value
+}
+const label = (value: unknown): string => typeof value === 'string' || typeof value === 'number' ? String(value) : show(value)
 const facts = (value: Row, keys: string[]): string => keys.filter(key => value[key] !== undefined).map(key => key + '=' + show(value[key])).join('; ')
 export function renderDocument(tool: string, args: Row, value: Row): string[] {
   const items = Array.isArray(value.items) ? value.items.filter(object) : []
   const lines = ['=== DOCUMENT: ' + show(value.path ?? args.path ?? '(path unavailable)') + ' ===',
     '[Observation: ' + facts(value, ['status', 'format', 'encoding', 'header', 'bytes', 'bytesRead', 'decodedBytes', 'processedBytes', 'revision', 'columnCount']) + '.]',
     '[Coverage: ' + facts(value, ['scanComplete', 'pageComplete', 'complete', 'rowsObserved', 'blocksObserved', 'pagesObserved', 'skipped', 'total', 'omitted', 'nextOffset', 'truncatedBy']) + '.]']
+  const failed = Array.isArray(value.failedPages) ? value.failedPages.filter(object) : []
+  if (failed.length) lines.push('[Failed pages: ' + failed.map(entry => label(entry.page) + ' ' + label(entry.code) + ' '
+    + show(clip(typeof entry.message === 'string' ? entry.message : '', 120))).join('; ') + ']')
   if (typeof value.scope === 'string') lines.push('[Scope: ' + show(value.scope) + '; excludedContent=' + show(value.excludedContent) + '. Completeness applies only to this scope.]')
   if (Array.isArray(value.columns)) lines.push('Columns: ' + show(value.columns))
   if (object(value.error)) lines.push('Error: ' + facts(value.error, ['code', 'message', 'effectState', 'nextAction']))

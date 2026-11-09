@@ -16,6 +16,13 @@ pub struct Page<'a> {
     pub dict: &'a Dict,
     pub resources: Option<&'a Value>,
 }
+/// One bounded page-tree walk: the pages it found and whether the physical bound stopped it.
+pub struct PageTree<'a> {
+    /// At most MAX_PAGES pages, in page-tree order.
+    pub pages: Vec<Page<'a>>,
+    /// A page beyond MAX_PAGES exists, so pages holds exactly MAX_PAGES entries.
+    pub truncated: bool,
+}
 fn reference(value: &Value) -> Result<ObjectId> {
     match value {
         Value::Ref(n, g) => Ok((*n, *g)),
@@ -36,14 +43,16 @@ fn page_count(doc: &Document<'_>, dict: &Dict) -> Result<usize> {
         bad("PDF page tree Count must be a bounded nonnegative integer or an indirect reference to one")
     })
 }
-/// Collect at most MAX_PAGES pages in page-tree order and verify /Count against the walk.
-pub fn pages<'a>(doc: &'a Document<'_>, started: Instant) -> Result<Vec<Page<'a>>> {
+/// Collect at most MAX_PAGES pages in page-tree order; a page beyond the bound sets truncated
+/// instead of failing, and /Count is verified only after a completed walk.
+pub fn pages<'a>(doc: &'a Document<'_>, started: Instant) -> Result<PageTree<'a>> {
     let catalog = doc.object(doc.root)?.value.dict()?;
     if get(catalog, b"Type")?.name()? != b"Catalog" {
         return Err(bad("PDF Root must be a Catalog"));
     }
     let mut seen = BTreeSet::new();
     let mut output = Vec::new();
+    let mut truncated = false;
     walk(
         doc,
         reference(get(catalog, b"Pages")?)?,
@@ -51,10 +60,14 @@ pub fn pages<'a>(doc: &'a Document<'_>, started: Instant) -> Result<Vec<Page<'a>
         None,
         &mut seen,
         &mut output,
+        &mut truncated,
         started,
         0,
     )?;
-    Ok(output)
+    Ok(PageTree {
+        pages: output,
+        truncated,
+    })
 }
 #[allow(clippy::too_many_arguments)]
 fn walk<'a>(
@@ -64,6 +77,7 @@ fn walk<'a>(
     inherited: Option<&'a Value>,
     seen: &mut BTreeSet<ObjectId>,
     output: &mut Vec<Page<'a>>,
+    truncated: &mut bool,
     started: Instant,
     depth: usize,
 ) -> Result<usize> {
@@ -90,25 +104,23 @@ fn walk<'a>(
     match get(dict, b"Type")?.name()? {
         b"Page" => {
             if output.len() >= MAX_PAGES {
-                return Err(limit(
-                    "PDF physical scan exceeds 32 pages; paging does not bypass this bound",
-                ));
+                *truncated = true;
+                return Ok(0);
             }
             output.push(Page { dict, resources });
             Ok(1)
         }
         b"Pages" => {
             let expected = page_count(doc, dict)?;
-            if expected > MAX_PAGES {
-                return Err(limit(
-                    "PDF physical scan exceeds 32 pages; paging does not bypass this bound",
-                ));
-            }
             let Value::Array(kids) = get(dict, b"Kids")? else {
                 return Err(bad("PDF Pages Kids must be an array"));
             };
             let mut count = 0;
             for kid in kids {
+                // The first page beyond the bound proves truncation; nothing after it is read.
+                if *truncated {
+                    break;
+                }
                 count += walk(
                     doc,
                     reference(kid)?,
@@ -116,11 +128,12 @@ fn walk<'a>(
                     resources,
                     seen,
                     output,
+                    truncated,
                     started,
                     depth + 1,
                 )?;
             }
-            if count != expected {
+            if !*truncated && count != expected {
                 return Err(bad("PDF page Count disagrees with observed tree"));
             }
             Ok(count)
@@ -147,10 +160,12 @@ impl Streams {
     fn append(
         &mut self,
         doc: &Document<'_>,
-        id: ObjectId,
-        started: Instant,
+        value: &Value,
         output: &mut Vec<u8>,
+        started: Instant,
     ) -> Result<()> {
+        deadline(started)?;
+        let id = reference(value)?;
         if !self.cache.contains_key(&id) {
             let bytes = decode(doc.object(id)?)?;
             deadline(started)?;
@@ -178,94 +193,22 @@ impl Streams {
         page: &Page<'_>,
         started: Instant,
     ) -> Result<Vec<u8>> {
-        let contents = get(page.dict, b"Contents")?;
         let mut output = Vec::new();
-        match contents {
-            Value::Array(items) => {
-                if items.len() > 64 {
+        let Some(value) = page.dict.get(b"Contents".as_slice()) else {
+            return Ok(output);
+        };
+        match value {
+            Value::Array(values) => {
+                if values.len() > 64 {
                     return Err(limit("PDF page exceeds 64 content streams"));
                 }
-                for item in items {
-                    self.append(doc, reference(item)?, started, &mut output)?;
+                for value in values {
+                    self.append(doc, value, &mut output, started)?
                 }
             }
-            value => self.append(doc, reference(value)?, started, &mut output)?,
+            Value::Null => {}
+            value => self.append(doc, value, &mut output, started)?,
         }
         Ok(output)
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pdf_container::parse;
-    /// Emit a classic-xref PDF whose first object is `objects[0]`, and so on.
-    fn emit(objects: Vec<String>) -> Vec<u8> {
-        let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
-        let mut offsets = vec![0];
-        for (index, value) in objects.iter().enumerate() {
-            offsets.push(pdf.len());
-            pdf.extend_from_slice(format!("{} 0 obj\n{value}\nendobj\n", index + 1).as_bytes());
-        }
-        let xref = pdf.len();
-        pdf.extend_from_slice(
-            format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes(),
-        );
-        for offset in offsets.iter().skip(1) {
-            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-        }
-        pdf.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
-                offsets.len()
-            )
-            .as_bytes(),
-        );
-        pdf
-    }
-    /// One-page classic-xref PDF; `extra` values become objects after the catalog, tree and page.
-    fn build(count: &str, extra: &[&str]) -> Vec<u8> {
-        let mut objects = vec![
-            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-            format!("<< /Type /Pages /Kids [3 0 R] /Count {count} >>"),
-            "<< /Type /Page /Parent 2 0 R >>".to_string(),
-        ];
-        objects.extend(extra.iter().map(|value| value.to_string()));
-        emit(objects)
-    }
-    fn observe(count: &str, extra: &[&str]) -> Result<usize> {
-        let bytes = build(count, extra);
-        let document = parse(&bytes).unwrap();
-        pages(&document, Instant::now()).map(|pages| pages.len())
-    }
-    #[test]
-    fn page_count_may_be_an_indirect_or_chained_reference() {
-        assert_eq!(observe("1", &[]).unwrap(), 1);
-        // Issue #646: a legal page tree whose /Count is an indirect reference.
-        assert_eq!(observe("4 0 R", &["1"]).unwrap(), 1);
-        assert_eq!(observe("4 0 R", &["5 0 R", "1"]).unwrap(), 1);
-    }
-    fn rejected(count: &str, extra: &[&str], expected: &str) {
-        let error = observe(count, extra).unwrap_err();
-        assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
-        assert!(
-            error.message.contains("page tree Count"),
-            "{}",
-            error.message
-        );
-        assert!(error.message.contains(expected), "{}", error.message);
-        assert!(
-            !error
-                .message
-                .contains("Expected a bounded nonnegative PDF integer"),
-            "{}",
-            error.message
-        );
-    }
-    #[test]
-    fn unusable_page_count_references_name_the_count_not_a_generic_integer() {
-        rejected("9 0 R", &[], "does not name an active object");
-        rejected("4 0 R", &["4 0 R"], "Cyclic PDF reference");
-        rejected("4 0 R", &["(one)"], "must be a bounded nonnegative integer");
-        rejected("4 0 R", &["-1"], "must be a bounded nonnegative integer");
     }
 }

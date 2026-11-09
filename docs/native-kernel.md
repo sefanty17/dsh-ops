@@ -251,23 +251,36 @@ reference pages retains the declared main-body scope independently of stored-row
 
 ## PDF parser foundation (15c/16)
 
-The internal PDF container parser accepts a restricted PDF 1.0-1.7 subset: one classic
-xref table, an exact final startxref/EOF footer, unique dictionary keys and object
-identities, and directly declared stream lengths. Every active xref offset must point
-exactly at its object header. Objects cannot overlap; gaps must contain only whitespace
-or comments. This deliberately rejects incremental updates, encryption, object/xref
-streams, recovery scans and ambiguous duplicate data. `/Encrypt`, `/ObjStm` and `/XRef`
-are refused wherever they appear, decoded escapes included, while `/Prev` and `/XRefStm` are
-refused only as trailer keys — the one place they denote an earlier xref section — so a
-dictionary that merely names them, such as an outline item's previous sibling, stays readable.
+The internal PDF container parser accepts a restricted PDF 1.0-1.7 subset: classic xref tables,
+cross-reference streams, object streams, and incremental updates that append sections to a
+`/Prev` chain, including the hybrid `/XRefStm` table a classic trailer may name, with an exact
+final startxref/EOF footer and unique dictionary keys. A `/Prev` chain stops at 64 sections and
+sections are merged newest first, so an older revision never overrides a newer entry; duplicate
+object numbers in one section are a parse error, while a number a newer section re-declares
+resolves to that newer entry. A cyclic `/Prev` chain, a hybrid table that disagrees with its
+stream on `/Prev`, or a cross-reference stream carrying `/XRefStm` is a structural failure. Stream `/Length`, trailer
+`/Size` and page-tree `/Count` may be indirect; the chain is resolved through the xref table
+with bounded hops and cycle detection. Every xref offset must point exactly at its section or
+object header, indexed constructs cannot overlap, and the header region before the first object
+holds only whitespace or comments. Recovery scans, encryption and ambiguous duplicate data are
+refused. A trailer `/Prev` or `/XRefStm` names earlier structure only there; the same names
+inside any other dictionary are ordinary data, and an outline item's `/Prev` for its previous
+sibling is an ordinary key. `/Encrypt` alone is refused at the name token because no supported
+structure can carry it.
 
 Bounds are checked before indexed allocation: 16 MiB per input, 10,000 xref entries,
-100,000 metadata values, depth 64, 4,096 keys per dictionary, 256 bytes per name/token,
-and 1 MiB per string or encoded/decoded stream. Reference chains have cycle detection
-and a depth bound. Streams support no filter or one FlateDecode only; external streams,
-filter chains and DecodeParms are declined. Actual decompression stops at the decoded
-limit plus one byte and requires a valid checksum, zlib terminator and exact consumption
-of the input. No size advertised by a PDF author bypasses these limits.
+100,000 metadata values, depth 64, 4,096 keys per dictionary, 4,096 objects per object
+stream, 256 bytes per name/token, 1 MiB per string or encoded/decoded stream, 8 MiB of
+decoded xref and object streams in aggregate across every section, 8 nested object-stream
+expansions and 64 nested object reads. Reference chains have cycle detection and a depth
+bound, and the container has a 20-second deadline. An object stream that names itself or its
+own compressed object reports a cyclic-structure failure; a chain past a depth bound or the
+64-section bound reports `OUTPUT_LIMIT`. Streams support no filter or one FlateDecode only;
+external streams and filter chains are declined, and `/DecodeParms` may name only Predictor 2
+(TIFF) or 10-15 (PNG) rows from `/Columns` and `/Colors` at an 8-bit component depth, so any
+other predictor, decode parameter or parameter array is declined. Actual decompression stops
+at the decoded limit plus one byte and requires a valid checksum, zlib terminator and exact
+consumption of the input. No size advertised by a PDF author bypasses these limits.
 
 This slice exposes no tool and makes no text-coverage claim. Page-tree interpretation,
 the supported font/encoding subset, partial results and worker authority checks are
@@ -277,39 +290,76 @@ implemented together in the PDF extraction slice documented below.
 
 The one-shot worker accepts strict read_pdf { path, offset?, limit? }. The host resolves
 path from its current directory. Offset is a 1-based page number (1–32, default 1);
-limit is 1–32 pages (default 10). The capability stays outside the default schema. Native selects it
+limit is 1–32 pages (default 10). An offset past the document's last page is
+`INVALID_ARGUMENT` named with the document's page count, not a completed empty read. The
+capability stays outside the default schema. Native selects it
 through `ops_discover_tools`, PTC through `ops_load_sdk`; it activates at the owning agent's next step.
 
 Each item is { page, text, runs: string[] }. Runs retain individual PDF text-show
-operations; TJ spacing numbers are not characters. Text joins runs with newlines for
-display. Scope is page-text-layer-content-order, **not rendered reading order**.
+operations; TJ spacing numbers are not characters. Text concatenates runs in content
+order; spaces and line breaks are not inferred. Scope is page-text-layer-content-order,
+**not rendered reading order**.
 Excluded content is stated in every result: layout, images/OCR, annotations/form fields,
-attachments/metadata, and structure-tree alternate text. A page invoking unsupported
-forms/images, marked content or external graphics state is a gap, even when it also has
-supported text. Blank absent/null/empty/comment-only content yields an empty page;
-nonempty graphics without a supported text layer is explicitly unsupported.
+attachments/metadata, structure-tree alternate text, and text painted by tiling patterns. Inside
+text objects the worker skips
+marked content (BMC/BDC/EMC, MP/DP) and the graphics-state, line-width and colour operators
+producers emit there (gs, g, G, w, rg, RG, k, K, sc, scn, SC, SCN, cs, CS); outside text objects
+it skips those plus the remaining graphics-state operators (J, j, M, i, d, ri, cm) and path
+construction and painting. None emits a glyph or reorders runs, so none creates a gap. An image
+XObject reached by `Do`, an inline image between `BI` and `EI`, and a shading reached by `sh`
+paint no glyphs and are skipped. A form XObject reached by `Do` is traversed in content order:
+its runs are appended where the `Do` occurs, its own `/Resources` take precedence over the page's
+inherited ones, nesting stops at depth 8, each page may decode at most 1 MiB of form content, and
+that content is charged to the 16 MiB aggregate decoded budget. Form text is read and images
+inside a form are skipped. Pattern colours reached by `sc`/`scn`/`SC`/`SCN` name a tiling
+pattern, whose painted text this layer does not traverse: 1-4 numeric components or one pattern
+name are validated and the operator is skipped. Blank absent/null/empty/comment-only content
+yields an empty page; nonempty graphics without a supported text layer is explicitly unsupported.
 
-The supported text subset is PDF 1.3–1.7 with the foundation's classic xref container,
-standard Helvetica/Courier/Times Type1 families, built-in StandardEncoding printable
-characters (including its curly quote glyphs), or named WinAnsiEncoding. The WinAnsi
-bullet/space/hyphen aliases are explicit; unknown/control codes are refused without
-replacement. Embedded/custom fonts, ToUnicode/CID maps and encoding differences are
-unsupported. Earlier PDF encodings are declined rather than reinterpreted. The mapping
+The supported text subset is PDF 1.3–1.7 with the container above, standard
+Helvetica/Courier/Times Type1 families, built-in StandardEncoding printable characters
+(including its curly quote glyphs), named WinAnsiEncoding, Type0 fonts with the predefined
+Identity-H/V encoding, and fonts carrying a `ToUnicode` CMap. `/Encoding` may be an indirect
+reference. The WinAnsi bullet/space/hyphen aliases are explicit; unknown/control codes are
+refused without replacement. Glyph programs, `DescendantFonts` and `CIDToGIDMap` are never
+read, and `ToUnicode` CMaps that inherit through `/UseCMap` are refused. `/Differences`,
+CMap-stream encodings, Type3 fonts, non-Identity CJK CMaps and CID fonts without a `ToUnicode`
+mapping are refused. Earlier PDF encodings are declined rather than reinterpreted. The mapping
 and operator semantics follow the [Adobe-hosted ISO 32000-1 reference, sections 9.4/9.6
 and Annex D](https://developer.adobe.com/document-services/docs/assets/35e4369068f86065372c18787171a17e/PDF_ISO_32000-1.pdf).
 
-Physical scanning stops at 32 pages, 30 seconds, 1 MiB decoded content per page, 64
+Physical scanning stops at 32 pages, 30 seconds, 1 MiB decoded content per page (page content
+plus at most 1 MiB of form content charged to the aggregate budget), 64
 content streams per page, 1 MiB text/10,000 runs per page, and 16 MiB aggregate decoded
 streams **and** 16 MiB processed stream bytes. Shared streams decode once but every
-reuse counts against processed work. The existing 16 MiB file and per-stream limits
-also apply. Page offsets do not bypass any physical bound.
+reuse counts against processed work; each `ToUnicode` table is decoded once per font
+object and each form decode is charged, so repeated form references pay again in the decoded
+budget. The existing 16 MiB file and per-stream limits also apply. Page offsets do not bypass
+any physical bound.
 
-scanComplete concerns the entire bounded text scope; pageComplete concerns the
-requested page range and becomes false on file changes. pagesObserved and skipped
-count actual observed pages. Only a stable complete scan includes total, omitted
-and a raw-file SHA-256 revision. Unsupported later pages retain only preceding complete
-pages, return an error/nextAction and omit full totals/revision. Rescan pagination must
-compare revisions before combining pages. Inline output is capped; the shared reference
+scanComplete reports that the bounded page tree covered the whole document and the requested
+pages raised no failure or inline cut; pageComplete reports only the requested page range and
+becomes false on file changes or that cut. status is the request window's verdict, while
+complete, truncated and nextAction describe the document. pagesObserved counts pages whose text
+was attempted (only the request window is decoded), and skipped counts bounded pages before that
+window. A PDF
+with more than 32 pages is truncated at the physical bound instead of failing the read: the page
+tree stops after 32 pages, the result carries `truncated: true` and `truncatedBy: "page-limit"`
+with a nextAction, scanComplete is false, and no total, omitted or revision is reported. Only a
+stable complete scan includes total, omitted and a raw-file SHA-256 revision. A requested page
+that cannot be read is a value, not the end of the call: readable pages still return with
+`status: partial`, the failure is listed in `failedPages` as `{page, code, message}` with a
+200-character message bound, and `truncatedBy` takes the most significant stopping cause: a
+deadline or changed file first, an output cut's `output-budget` next, then the first failed page's
+cause. Failures stay in `failedPages`. Pages outside
+the request window are never decoded, so their failures and decode cost cannot change the
+result. Readable pages in a failed subset window still return; only a document whose every
+bounded page failed returns `status: error` carrying the first failure, while a window whose
+requested pages all failed stays partial when the document holds pages outside it. Rescan
+pagination must compare revisions before combining pages; `nextOffset` names the first unreturned
+page, and is omitted when the computed page exceeds the tool's 1–32 offset range, which normally
+means page 32 failed or the window ended at EOF.
+Inline output is capped; the shared reference
 sink captures whole pages before clipping, and stored pages retain original scope and
 scan/capture completeness. A reference page being complete does not fill a source gap.
 Read-only, credential denial, no-follow opens and no-business-effect failures use the

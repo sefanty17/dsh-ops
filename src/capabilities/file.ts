@@ -104,7 +104,7 @@ export const SEARCH_OUTPUT: JsonSchemaNode = {
     scannedFiles: { type: 'integer' }, skippedFiles: { type: 'integer' },
     skipReasons: { type: 'object' }, matchedObserved: { type: 'integer' },
     matchedTotal: { type: 'integer', description: 'Present only after a complete scan.' },
-    truncatedBy: { type: 'string', enum: ['scan-budget', 'output-budget', 'time', 'row-limit', 'none'] },
+    truncatedBy: { type: 'string', enum: ['scan-budget', 'output-budget', 'time', 'row-limit', 'page-limit', 'none'] },
     continuation: string, nextAction: string,
   },
 }
