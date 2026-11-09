@@ -20,14 +20,15 @@ const font = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /Win
 const page = content => '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ' + content + ' >>'
 function padded(size, label = 'ok') { const prefix = show(label); return prefix + '%' + 'x'.repeat(size - Buffer.byteLength(prefix) - 2) + '\n' }
 
-await test('raw and Flate PDF pages preserve literal/hex/TJ runs and exact WinAnsi Unicode', async () => {
+await test('raw and Flate PDF pages preserve literal/hex/TJ runs; text infers no separators', async () => {
   await withTempDir('pdf-text', async root => {
     const content = 'BT /F1 12 Tf (A\\(B\\)\\\\C) Tj [<436166e9> -120 ( ) 5 <80>] TJ T* (next) \' 0 0 (last) " ET\n'
     for (const deflate of [false, true]) {
       const bytes = textPdf([content], { deflate }), body = await run(root, { path: fileAt(root, bytes) })
       assert.equal(body.error, undefined); assert.equal(body.status, 'completed'); assert.equal(body.complete, true)
       assert.equal(body.scope, 'page-text-layer-content-order'); assert.ok(body.excludedContent.includes('images and OCR'))
-      assert.deepEqual(body.items, [{ page: 1, text: 'A(B)\\C\nCafé €\nnext\nlast', runs: ['A(B)\\C', 'Café €', 'next', 'last'] }])
+      // text concatenates the runs in content order; no space or line break is inferred between them.
+      assert.deepEqual(body.items, [{ page: 1, text: 'A(B)\\CCafé €nextlast', runs: ['A(B)\\C', 'Café €', 'next', 'last'] }])
       assert.equal(body.total, 1); assert.equal(body.revision, createHash('sha256').update(bytes).digest('hex')); assert.equal(body.nextOffset, 2)
     }
     const aliases = await run(root, { path: fileAt(root, textPdf([show(Buffer.from([127,129,141,143,144,157,160,173,159]))])) })
@@ -48,11 +49,54 @@ await test('page offsets have complete-scan totals, ten-page default and honest 
 })
 await test('unsupported later operators keep preceding complete pages without inventing a total or cursor', async () => {
   await withTempDir('pdf-gaps', async root => {
-    for (const content of ['/X1 Do', 'BI /W 1 /H 1 ID x EI', '/Tag BMC EMC', '/GS1 gs', '0 0 m 1 1 l S', 'BX weird EX']) {
+    // These pages hold no text run: an untraversed operator (BX/EX) or paint operators that are
+    // skipped still leave the page without a supported text layer, so the gap stays a page failure.
+    for (const content of ['BI /W 1 /H 1 ID x EI', '/Tag BMC EMC', '/GS1 gs', '0 0 m 1 1 l S', 'BX weird EX']) {
       const body = await run(root, { path: fileAt(root, textPdf([show('safe'), content, show('unobserved')])), limit: 1 })
       failure(body, 'UNSUPPORTED_DOCUMENT'); assert.equal(body.status, 'partial'); assert.equal(body.scanComplete, false); assert.equal(body.pageComplete, true)
       assert.equal(body.pagesObserved, 1); assert.deepEqual(body.items.map(i => i.text), ['safe']); assert.match(body.nextAction, /paging|offsets|gaps/i); assert.equal(body.continuation, undefined)
     }
+    // A Do that names no XObject is malformed, not unsupported; the preceding page still returns.
+    const missing = await run(root, { path: fileAt(root, textPdf([show('safe'), '/X1 Do', show('unobserved')])), limit: 1 })
+    failure(missing, 'DOCUMENT_PARSE_ERROR'); assert.equal(missing.status, 'partial'); assert.equal(missing.scanComplete, false); assert.equal(missing.pageComplete, true)
+    assert.equal(missing.pagesObserved, 1); assert.deepEqual(missing.items.map(i => i.text), ['safe']); assert.match(missing.error.message, /Missing PDF XObject/)
+    assert.match(missing.nextAction, /paging|offsets|gaps/i); assert.equal(missing.continuation, undefined)
+  })
+})
+await test('paint and graphics-state operators between text segments are skipped', async () => {
+  await withTempDir('pdf-paint', async root => {
+    // Each operator paints no glyph, so skipping it cannot change the extracted runs. A page
+    // whose content would otherwise hold no text still fails as "no supported text layer", so
+    // every case keeps text on both sides of the skipped operator. Text concatenates the runs in
+    // content order and infers no separator, so the two segments meet directly.
+    const cases = ['/Tag BMC EMC', '/GS1 gs', '0 0 m 1 1 l S', '/Sh1 sh', 'BI /W 1 /H 1 ID x EI']
+    for (const operator of cases) {
+      const content = 'BT /F1 12 Tf (before) Tj ET ' + operator + ' BT /F1 12 Tf (after) Tj ET'
+      const body = await run(root, { path: fileAt(root, textPdf([content])) })
+      assert.equal(body.error, undefined, operator); assert.equal(body.status, 'completed'); assert.equal(body.complete, true); assert.equal(body.scanComplete, true)
+      assert.deepEqual(body.items[0], { page: 1, text: 'beforeafter', runs: ['before', 'after'] }, operator)
+    }
+    // An image XObject paints pixels only, so its Do is skipped and both text segments survive.
+    const objects = [catalog, '<< /Type /Pages /Kids [4 0 R] /Count 1 >>', font,
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>',
+      stream('BT /F1 12 Tf (before) Tj ET /Im1 Do BT /F1 12 Tf (after) Tj ET'),
+      stream('x', { extra: '/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray' })]
+    const painted = await run(root, { path: fileAt(root, pdf(objects), 'image.pdf') })
+    assert.equal(painted.error, undefined); assert.equal(painted.status, 'completed'); assert.equal(painted.complete, true)
+    assert.deepEqual(painted.items[0], { page: 1, text: 'beforeafter', runs: ['before', 'after'] })
+  })
+})
+await test('form XObjects contribute their text where their Do appears', async () => {
+  await withTempDir('pdf-forms', async root => {
+    // The form names no resources of its own, so its /F1 resolves through the page's resources;
+    // its run lands where the page invokes Do, between the page's own two segments.
+    const objects = [catalog, '<< /Type /Pages /Kids [4 0 R] /Count 1 >>', font,
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> /XObject << /Fm1 6 0 R >> >> /Contents 5 0 R >>',
+      stream('BT /F1 12 Tf (before) Tj ET /Fm1 Do BT /F1 12 Tf (after) Tj ET'),
+      stream('BT /F1 12 Tf (inside) Tj ET', { extra: '/Type /XObject /Subtype /Form /BBox [0 0 1 1]' })]
+    const body = await run(root, { path: fileAt(root, pdf(objects), 'form.pdf') })
+    assert.equal(body.error, undefined); assert.equal(body.status, 'completed'); assert.equal(body.complete, true)
+    assert.deepEqual(body.items, [{ page: 1, text: 'beforeinsideafter', runs: ['before', 'inside', 'after'] }])
   })
 })
 await test('unsupported fonts mappings controls and older encoding semantics fail explicitly', async () => {

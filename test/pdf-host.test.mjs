@@ -47,7 +47,9 @@ await test('real PDF discovery activates next step for its owner and PTC pages p
   } finally { await shutdown(ctx) }
 }))
 await test('unsupported later PDF pages retain only preceding complete pages and never resume the same gap', () => withTempDir('pdf-host-gap', async root => {
-  fs.writeFileSync(path.join(root, 'text.pdf'), textPdf([show('safe prefix'), show('not complete') + '/Im1 Do\n']))
+  // A `BX` outside a text object is content this reader still refuses, so page 2 stays unsupported
+  // without depending on a declared XObject; a `Do` naming no XObject is a parse error instead.
+  fs.writeFileSync(path.join(root, 'text.pdf'), textPdf([show('safe prefix'), show('not complete') + 'BX weird EX\n']))
   const { ctx, agent } = await documentHost(root, ['read_pdf'])
   try {
     const native = await agent(), code = await agent('ptc')

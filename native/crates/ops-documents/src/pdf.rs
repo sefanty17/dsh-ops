@@ -93,7 +93,7 @@ pub fn read(request: &Request) -> Result<Value> {
             continue;
         }
         selected += 1;
-        let item = json!({"page":number,"text":runs.join("\n"),"runs":runs});
+        let item = json!({"page":number,"text":runs.concat(),"runs":runs});
         if let Some(sink) = request.output_sink.as_deref() {
             sink.push(&item)
         }
@@ -132,7 +132,7 @@ pub fn read(request: &Request) -> Result<Value> {
         "none"
     };
     let mut output = json!({"status":if scan{"completed"}else{"partial"},"phase":"verify","changed":0,"effectState":"none","path":target.display,"format":"pdf",
-        "scope":"page-text-layer-content-order","excludedContent":["rendered layout and reading order","images and OCR","annotations and form fields","attachments and document metadata","structure-tree alternate text"],
+        "scope":"page-text-layer-content-order","excludedContent":["rendered layout and reading order","images and OCR","annotations and form fields","attachments and document metadata","structure-tree alternate text","text painted by tiling patterns"],
         "bytes":before.len(),"decodedBytes":streams.decoded,"processedBytes":streams.processed,"pagesObserved":observed,"skipped":(args.offset-1).min(observed),
         "scanComplete":scan,"pageComplete":page_complete(failure.as_ref(),observed,args.offset,args.limit),"complete":scan&&!more,"truncated":more,"truncatedBy":cause,"nextOffset":next,"items":[]});
     if scan {

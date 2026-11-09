@@ -8,6 +8,7 @@ mod pdf;
 mod pdf_cmap;
 pub mod pdf_container;
 mod pdf_font;
+mod pdf_form;
 mod pdf_limits;
 mod pdf_pages;
 mod pdf_predictor;

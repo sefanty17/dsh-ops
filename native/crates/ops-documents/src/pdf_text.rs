@@ -3,10 +3,14 @@ use crate::{
     pdf_container::{Document, ObjectId, get},
     pdf_font::FontDecoder,
     pdf_limits::{MAX_CONTENT_DECODED, MAX_TEXT, deadline},
-    pdf_syntax::{Lexer, Value, bad, limit, unsupported},
+    pdf_syntax::{Lexer, Value, bad, limit, unsupported, white},
 };
 use ops_protocol::Result;
-use std::{collections::BTreeMap, rc::Rc, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+    time::Instant,
+};
 /// Fonts whose character-code tables one document may decode.
 pub const MAX_FONTS: usize = 64;
 /// The decoders one page has built, keyed by the /Font resource name its Tf selected; an inline
@@ -79,6 +83,21 @@ fn numbers(args: &[Value], count: usize) -> Result<()> {
 fn no_args(args: &[Value]) -> Result<()> {
     numbers(args, 0)
 }
+/// Charge one text run against the page's 1 MiB / 10,000-run bound and append it.
+fn push_run(runs: &mut Vec<String>, text_bytes: &mut usize, run: String) -> Result<()> {
+    if runs.len() >= 10_000 || *text_bytes + run.len() + 1 > MAX_TEXT {
+        return Err(limit("PDF page text exceeds 1 MiB or 10000 runs"));
+    }
+    *text_bytes += run.len() + 1;
+    runs.push(run);
+    Ok(())
+}
+fn named(args: &[Value], count: usize) -> Result<()> {
+    if args.len() != count || !args.iter().all(|arg| matches!(arg, Value::Name(_))) {
+        return Err(bad("Invalid PDF name operator arguments"));
+    }
+    Ok(())
+}
 fn string(value: &Value, decoder: &FontDecoder) -> Result<String> {
     match value {
         Value::String(bytes) => decoder.decode(bytes),
@@ -113,6 +132,78 @@ fn selected_decoder(
         }
     }
 }
+// Operators tolerated inside a text object although ISO 32000-1 9.4 allows only text operators:
+// each sets graphics state, a colour space or rendering intent, or marks marked content, so none
+// emits a glyph or reorders runs. WPS and LibreOffice exports put several between BT and ET.
+fn tolerated_in_text(op: &[u8]) -> bool {
+    matches!(
+        op,
+        b"gs"
+            | b"g"
+            | b"G"
+            | b"w"
+            | b"J"
+            | b"j"
+            | b"M"
+            | b"d"
+            | b"i"
+            | b"ri"
+            | b"rg"
+            | b"RG"
+            | b"k"
+            | b"K"
+            | b"sc"
+            | b"scn"
+            | b"SC"
+            | b"SCN"
+            | b"cs"
+            | b"CS"
+            | b"BMC"
+            | b"BDC"
+            | b"EMC"
+            | b"MP"
+            | b"DP"
+    )
+}
+/// Skip one inline image whose BI operator the lexer has just read: read the parameter dictionary
+/// to ID, then skip the binary data to EI. An inline image paints no glyphs, so text cannot change.
+fn inline_image(lexer: &mut Lexer<'_>) -> Result<()> {
+    loop {
+        lexer.skip();
+        let Some(&b) = lexer.data.get(lexer.at) else {
+            return Err(bad("PDF inline image is missing its ID keyword"));
+        };
+        if b.is_ascii_digit() || b"+-./(<[/".contains(&b) {
+            lexer.value(0)?;
+            continue;
+        }
+        match lexer.word()? {
+            b"ID" => break,
+            // An inline image entry may be a value keyword (/IM true), not an operator.
+            b"true" | b"false" | b"null" => {}
+            _ => return Err(bad("Invalid PDF inline image parameter")),
+        }
+    }
+    if lexer.data.get(lexer.at).is_none_or(|b| !white(*b)) {
+        return Err(bad("PDF inline image ID is not followed by whitespace"));
+    }
+    lexer.at += 1;
+    // EI ends the data only when whitespace surrounds it, so the same bytes inside data do not.
+    for at in lexer.at..lexer.data.len().saturating_sub(1) {
+        if lexer.data[at] == b'E'
+            && lexer.data[at + 1] == b'I'
+            && white(lexer.data[at - 1])
+            && (at + 2 == lexer.data.len() || white(lexer.data[at + 2]))
+        {
+            lexer.at = at + 2;
+            return Ok(());
+        }
+    }
+    Err(bad("PDF inline image is missing its EI keyword"))
+}
+/// Extract the text runs of one page content stream in content order, following form XObjects;
+/// fonts caches the decoders already selected, decoded is the document's decoded-stream budget and
+/// form_bytes bounds the form content this page reads.
 pub fn extract(
     doc: &Document<'_>,
     resources: Option<&Value>,
@@ -121,8 +212,49 @@ pub fn extract(
     fonts: &mut Fonts,
     decoded: &mut usize,
 ) -> Result<Vec<String>> {
-    // Inline font dictionaries have no object identity, so each page charges and caches its own.
-    let mut page_fonts = PageFonts::new();
+    // Blank and comment-only content is an empty page, not a content gap: the stream holds no
+    // operator at all.
+    let mut probe = Lexer::new(bytes);
+    probe.skip();
+    if probe.at == bytes.len() {
+        return Ok(Vec::new());
+    }
+    let mut form_bytes = 0usize;
+    let mut expanding = BTreeSet::new();
+    let runs = traverse(
+        doc,
+        resources,
+        bytes,
+        started,
+        fonts,
+        decoded,
+        &mut form_bytes,
+        &mut expanding,
+        0,
+    )?;
+    if runs.iter().all(String::is_empty) {
+        return Err(unsupported(
+            "PDF content has no supported text layer; OCR is not provided",
+        ));
+    }
+    Ok(runs)
+}
+/// Extract one content stream — a page's or a form XObject's — appending the runs of the forms
+/// its `Do` reaches; form_bytes bounds the form content one page decodes and expanding holds
+/// the objects currently being expanded, so a form cannot reference itself into unbounded
+/// recursion.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn traverse(
+    doc: &Document<'_>,
+    resources: Option<&Value>,
+    bytes: &[u8],
+    started: Instant,
+    fonts: &mut Fonts,
+    decoded: &mut usize,
+    form_bytes: &mut usize,
+    expanding: &mut BTreeSet<ObjectId>,
+    depth: usize,
+) -> Result<Vec<String>> {
     if bytes.iter().all(|b| crate::pdf_syntax::white(*b)) {
         return Ok(Vec::new());
     }
@@ -132,10 +264,9 @@ pub fn extract(
         return Ok(Vec::new());
     }
     let mut args = Vec::new();
-    let mut inside = false;
-    let mut selected: Option<Selection> = None;
-    let mut stack: Vec<Option<Selection>> = Vec::new();
+    let (mut inside, mut selected, mut stack) = (false, None, Vec::new());
     let (mut runs, mut text_bytes) = (Vec::new(), 0usize);
+    let mut page_fonts = PageFonts::new();
     loop {
         deadline(started)?;
         lexer.skip();
@@ -172,6 +303,7 @@ pub fn extract(
                     | b"Tr"
                     | b"BT"
             )
+            && !tolerated_in_text(op)
         {
             return Err(bad("Non-text PDF operator inside a text object"));
         }
@@ -263,9 +395,6 @@ pub fn extract(
             }
             b"q" => {
                 no_args(&args)?;
-                if inside {
-                    return Err(unsupported("PDF q inside a text object is unsupported"));
-                }
                 if stack.len() >= 64 {
                     return Err(limit("PDF graphics state exceeds depth 64"));
                 }
@@ -273,9 +402,6 @@ pub fn extract(
             }
             b"Q" => {
                 no_args(&args)?;
-                if inside {
-                    return Err(unsupported("PDF Q inside a text object is unsupported"));
-                }
                 selected = stack.pop().ok_or_else(|| bad("Unbalanced PDF Q"))?
             }
             b"cm" | b"c" => numbers(&args, 6)?,
@@ -299,29 +425,89 @@ pub fn extract(
                 }
                 args[0].name()?;
             }
+            // Paint that carries no text of its own: image XObjects, shadings and inline images
+            // emit no glyph, so skipping one cannot change the runs. A form XObject may hold text
+            // of its own, so its content stream is traversed within the depth and byte bounds.
+            b"Do" => {
+                named(&args, 1)?;
+                let name = args[0].name()?;
+                let nested = crate::pdf_form::paint(
+                    doc, resources, name, started, fonts, decoded, form_bytes, expanding, depth,
+                )?;
+                for run in nested {
+                    push_run(&mut runs, &mut text_bytes, run)?;
+                }
+            }
+            b"BI" => {
+                if !args.is_empty() {
+                    return Err(bad("Invalid PDF inline image operands"));
+                }
+                inline_image(&mut lexer)?;
+            }
+            b"sh" => named(&args, 1)?,
+            // Skipped without semantics: these change graphics state or label content only.
+            b"gs" => named(&args, 1)?,
+            b"cs" | b"CS" => {
+                // The colour space is named here; its components arrive later and paint nothing.
+                if args.len() != 1 || !matches!(args[0], Value::Name(_)) {
+                    return Err(bad("Invalid PDF colour space arguments"));
+                }
+            }
+            b"BMC" => named(&args, 1)?,
+            b"BDC" => {
+                // The property list may be a name, dictionary or reference; it is never traversed.
+                if args.len() != 2
+                    || !matches!(args[0], Value::Name(_))
+                    || !matches!(args[1], Value::Name(_) | Value::Dict(_) | Value::Ref(..))
+                {
+                    return Err(bad("Invalid PDF marked-content BDC arguments"));
+                }
+            }
+            b"EMC" => no_args(&args)?,
+            b"MP" => {
+                if args.len() != 1 || !matches!(args[0], Value::Name(_)) {
+                    return Err(bad("Invalid PDF marked-content MP arguments"));
+                }
+            }
+            b"DP" => {
+                // The property list is optional and labels a point; it is never traversed.
+                if args.is_empty()
+                    || args.len() > 2
+                    || !matches!(args[0], Value::Name(_))
+                    || (args.len() == 2
+                        && !matches!(args[1], Value::Name(_) | Value::Dict(_) | Value::Ref(..)))
+                {
+                    return Err(bad("Invalid PDF marked-content DP arguments"));
+                }
+            }
+            b"sc" | b"scn" | b"SC" | b"SCN" => {
+                // 1-4 components with an optional trailing pattern name, or one name for a coloured
+                // pattern. The pattern's own content is not traversed by this layer, so text it
+                // paints is excluded; the operands are checked and then skipped.
+                let components = match args.last() {
+                    Some(Value::Name(_)) => &args[..args.len() - 1],
+                    _ => &args[..],
+                };
+                if args.is_empty() || components.len() > 4 || !components.iter().all(numeric) {
+                    return Err(bad(
+                        "Invalid PDF colour components: 1-4 numbers or one pattern name",
+                    ));
+                }
+            }
             _ => {
                 return Err(unsupported(format!(
-                    "Unsupported PDF content operator {}; forms, images, marked content and external graphics state are not traversed",
+                    "Unsupported PDF content operator {}; unknown operators are not traversed",
                     String::from_utf8_lossy(op)
                 )));
             }
         }
         if let Some(run) = shown {
-            if runs.len() >= 10_000 || text_bytes + run.len() + 1 > MAX_TEXT {
-                return Err(limit("PDF page text exceeds 1 MiB or 10000 runs"));
-            }
-            text_bytes += run.len() + 1;
-            runs.push(run);
+            push_run(&mut runs, &mut text_bytes, run)?;
         }
         args.clear();
     }
     if inside || !stack.is_empty() || !args.is_empty() {
         return Err(bad("Unclosed PDF text/graphics state or dangling operands"));
-    }
-    if runs.iter().all(String::is_empty) {
-        return Err(unsupported(
-            "PDF content has no supported text layer; OCR is not provided",
-        ));
     }
     Ok(runs)
 }
