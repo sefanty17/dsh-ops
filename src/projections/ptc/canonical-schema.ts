@@ -1,6 +1,6 @@
 /** Typed fields describe canonical data, independently of the Native display projection. */
 import type { JsonSchemaNode } from '../../adapter/dsh/types.js'
-import { DOCUMENT_FACTS, isDocumentTool } from '../../capabilities/documents.js'
+import { DOCUMENT_FACTS, FAILED_PAGES, isDocumentTool } from '../../capabilities/documents.js'
 import { capability } from '../../capabilities/registry.js'
 import type { FileToolName, PtcToolName } from '../../capabilities/registry.js'
 import { STORAGE_REFERENCE } from '../../capabilities/result.js'
@@ -40,7 +40,7 @@ export function canonicalOutput(tool: FileToolName | PtcToolName): JsonSchemaNod
   else if (tool === 'stat') Object.assign(properties, facts, { exists: boolean, path: string, readonly: boolean, mode: string, modifiedMs: nullableInteger })
   else if (tool === 'diff') Object.assign(properties, { before: object(facts), after: object(facts),
     hunk: object({ startLine: integer, removed: integer, added: integer }), items: array(object({ kind: string, line: integer, text: string })) })
-  else if (tool === 'result') properties.source = object({ ...range, ...coverage, ...DOCUMENT_FACTS, root: string,
+  else if (tool === 'result') properties.source = object({ ...range, ...coverage, ...DOCUMENT_FACTS, failedPages: FAILED_PAGES, root: string,
     itemEncoding: string, capturedItems: integer, captureComplete: boolean })
   else if (tool === 'replace') Object.assign(properties, { pending: integer, items: array(replacementReceipt) })
   else if (tool !== 'batch') properties.items = array(receipt)

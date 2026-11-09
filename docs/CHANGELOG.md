@@ -14,6 +14,57 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - 读取 xref 偏移比对象头提前最多 32 个空白字节的 PDF（Microsoft Print to PDF 的每个在用偏移都如此），
   不再以 `PDF xref must point exactly to an object header` 失败；对象头所在行只要 `%` 出现在头之前
   （即使不是行首）就按注释拒绝（#646）。
+- Traverse form XObjects reached by `Do` in content order, preferring the form's own `/Resources`
+  over the page's inherited ones, with depth 8 and at most 1 MiB of form content per page charged
+  to the 16 MiB aggregate decoded budget; text inside a form is read and images are skipped (#646).
+- 按内容顺序展开经 `Do` 到达的 Form XObject：自身 `/Resources` 优先于页面继承资源，嵌套深度上限 8，
+  每页最多 1 MiB Form 内容并计入 16 MiB 累计解码预算；Form 内文字会被读出，图片跳过（#646）。
+- Skip tiling-pattern colour operands (`sc`/`scn`/`SC`/`SCN`) after validating 1-4 numeric
+  components or one pattern name; text painted by the pattern is excluded and named in
+  `excludedContent` (#646).
+- 校验 1–4 个数值分量或单个图案名称后跳过平铺图案颜色操作符（`sc`/`scn`/`SC`/`SCN`）；图案绘制的
+  文本列入排除内容并在 `excludedContent` 中说明（#646）。
+
+- Isolate PDF page failures to the requested window: only pages inside `offset`..`offset+limit-1`
+  are decoded, a failed page becomes a `failedPages` entry instead of failing the call, a window
+  with no failure completes even when a later page is unreadable, and only a document whose every
+  bounded page failed is a top-level error. The `read_pdf` description and native-kernel docs state
+  the window rule, Native renders each entry's page, code and bounded message, and the PTC
+  canonical schema declares the field (#646).
+- 将 PDF 逐页失败隔离在请求窗口内：只解码 `offset`..`offset+limit-1` 范围内的页，失败页写入
+  `failedPages` 而不是让整次调用失败；窗口内无失败时，即使后续页不可读也按 completed 返回；
+  仅当有界文档的每一页都失败时才返回顶层 error。`read_pdf` 描述与原生内核文档同步说明该窗口规则，
+  Native 渲染每个条目的页码、错误码与截断消息，PTC canonical schema 声明该字段（#646）。
+
+- Report an output cut as `truncatedBy: "output-budget"` with `nextOffset` naming the first
+  withheld page, omit `nextOffset` when the computed page is outside the tool's 1–32 offset range
+  (page 32 failed or EOF), and let a deadline or changed file outrank the cut as the stopping cause
+  (#646).
+- 内联输出截断时以 `truncatedBy: "output-budget"` 报告，`nextOffset` 指向首个未返回页；计算出的页号
+  超出工具 1–32 offset 范围（第 32 页失败或 EOF）时省略该字段；deadline 或文件变化优先于截断成为
+  停止原因（#646）。
+
+- Concatenate PDF text runs in content order with no inserted separator, so per-glyph producers
+  such as MuPDF read as `Sefanty` instead of one glyph per line; spaces and line breaks are not
+  inferred and stay absent when the glyph stream does not carry them (#646).
+- 按内容顺序直接拼接 PDF 文本 run，不插入任何分隔符：MuPDF 等逐字形导出现在读出 `Sefanty`，
+  而不是每行一个字形；空格与换行不作推断，字形流没有携带时保持缺失（#646）。
+- Reject a `read_pdf` offset beyond the document's last page with `INVALID_ARGUMENT` naming the
+  document's page count instead of a completed observation with no pages; the 32-page physical
+  bound and the 1–32 argument range are unchanged (#646).
+- `read_pdf` 的 offset 超过文档末页时返回 `INVALID_ARGUMENT` 并给出文档页数，不再返回没有页面的
+  已完成观察；32 页物理上限与 1–32 参数范围不变（#646）。
+- Give an encrypted PDF a specific nextAction — remove the open password and re-export without
+  encryption, or use a dedicated PDF reader — instead of the protocol's generic hint; page offsets
+  and limits cannot decrypt it (#646).
+- 加密 PDF 的 nextAction 改为具体恢复建议——移除打开密码后重新导出，或使用专用 PDF 阅读器——不再
+  使用协议的泛化提示；页码偏移与 limit 无法解密文档（#646）。
+- Name `read_pdf`'s arguments at the start of its description (`path`, optional `offset` 1–32,
+  optional `limit` 1–32) so a first call cannot mistake them for `pages`, `maxPages` or
+  `file_path`; the always-loaded document trio re-measures at 926 tokens / 3991 bytes.
+- `read_pdf` 描述开头写明参数名（`path`、可选 `offset` 1–32、可选 `limit` 1–32），首轮调用不再
+  误用 `pages`、`maxPages` 或 `file_path`；常驻文档三件套重新测量为 926 tokens / 3991 bytes。
+
 - Accept package-manager hardlinks only in rehashed Niubash source payloads while requiring exclusive execution copies; cover a real offline pnpm hardlink consumer and keep gate orchestration fixtures independent of a host Git Bash installation.
 - Niubash 源载荷逐字节校验后兼容包管理器硬链接，执行副本仍要求独占文件；增加真实离线 pnpm 硬链接消费者验证，并让门禁编排测试不依赖宿主 Git Bash 安装。
 
@@ -168,6 +219,22 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   instead of failing with "Expected a bounded nonnegative PDF integer" (#646).
 - 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
   带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败（#646）。
+- Read PDF pages whose text is wrapped in marked content or preceded by graphics-state
+  operators: skip the listed graphics-state, line-width and colour operators (`gs`, `g`/`G`,
+  `w`, `rg`/`RG`, `k`/`K`, `sc`/`scn`/`SC`/`SCN`, `cs`/`CS`) and the marked-content operators
+  (`BMC`/`BDC`/`EMC`, `MP`/`DP`), none of which emits a glyph, instead of failing the page.
+  WPS and Firefox exports now reach the font layer rather than an operator error (#646).
+- 读取文本被标记内容包裹、或前置图形状态操作符的 PDF 页面：跳过下列不产生字形的图形状态、线宽
+  与颜色操作符（`gs`、`g`/`G`、`w`、`rg`/`RG`、`k`/`K`、`sc`/`scn`/`SC`/`SCN`、`cs`/`CS`）以及
+  标记内容操作符（`BMC`/`BDC`/`EMC`、`MP`/`DP`），不再整页失败。WPS 与 Firefox 导出的文件现在
+  会进入字体层而非报操作符错误（#646）。
+- Skip painting operators that carry no text: an image XObject reached by `Do`, an inline image
+  between `BI` and `EI`, and a shading reached by `sh` no longer turn the page into a gap, and
+  path construction and painting are skipped outside text objects. A form XObject reached by
+  `Do` may hold a text layer of its own and is traversed rather than skipped (#646).
+- 跳过不携带文本的绘制操作符：经 `Do` 到达的图片 XObject、`BI` 与 `EI` 之间的内联图片，以及经
+  `sh` 到达的渐变不再把整页变成缺口；文本对象外的路径构造与绘制操作符同样跳过。经 `Do` 到达的
+  Form XObject 可能自带文本层，现已展开读取而非跳过（#646）。
 - Read PDFs whose text layer uses an embedded or CID font: Type0/Identity-H/V fonts and simple
   fonts carrying a `ToUnicode` CMap now map character codes to Unicode, where only standard
   Type1 encodings were decoded before. Glyph programs, `DescendantFonts` and `CIDToGIDMap`
@@ -197,6 +264,22 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - 还原 Flate 流 predictor：按 `/Columns`、`/Colors` 与 8 位 `/BitsPerComponent` 反解
   `/DecodeParms` 的 Predictor 2（TIFF）与 10–15（PNG）行，因此按行预测写出的 xref 流与对象流
   也能读取；其它 predictor、解码参数或参数数组仍被拒绝（#646）。
+- Truncate a PDF beyond 32 pages instead of failing the whole read: the page tree stops at the
+  physical bound and the result reports `truncated: true`, `truncatedBy: "page-limit"`,
+  `scanComplete: false` and a nextAction, without `total`, `omitted` or `revision`; requested
+  pages inside the bound keep their own `pageComplete` (#646).
+- 超过 32 页的 PDF 改为截断返回而不是整份失败：页面树在物理上限处停止，结果报告
+  `truncated: true`、`truncatedBy: "page-limit"`、`scanComplete: false` 与 nextAction，不给出
+  `total`、`omitted` 或 `revision`；上限内的请求页仍保留各自的 `pageComplete`（#646）。
+- Align the `read_pdf` capability description with the implemented reader — xref tables and
+  streams with object streams and incremental `/Prev` chains, TIFF/PNG `DecodeParms` predictors,
+  embedded Type0 Identity and `ToUnicode`/WinAnsi/Standard fonts, and 32-page `page-limit`
+  truncation; re-derive the always-loaded document trio in the discovery docs from the
+  catalogue (926 tokens / 3991 bytes).
+- `read_pdf` 能力描述与读取器实现对齐：xref 表与流加对象流及增量 `/Prev` 链、TIFF/PNG
+  `DecodeParms` predictor、嵌入 Type0 Identity 与 `ToUnicode`/WinAnsi/Standard 字体，以及
+  32 页 `page-limit` 截断；发现文档中的常驻文档三件套按 catalogue 重新推导
+  （926 tokens / 3991 bytes）。
 
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 

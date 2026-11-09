@@ -53,6 +53,21 @@ fn xref_stream_document(dict: &str, rows: &[[u8; 7]]) -> Vec<u8> {
 }
 
 #[test]
+fn the_mupdf_xref_stream_fixture_reads_its_text() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mupdf-xref-stream.pdf");
+    let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {path:?}: {error}"));
+    assert_eq!(bytes.len(), 77_589, "the fixture bytes must stay the one sample");
+    let output = read(&bytes, json!({})).expect("a real MuPDF xref stream must read");
+    assert_eq!(output["status"], "completed", "{output}");
+    assert_eq!(output["total"], 1, "{output}");
+    let runs = output["items"][0]["runs"].as_array().expect("page runs");
+    assert!(runs.len() > 1, "the sample shows one glyph per run: {output}");
+    assert!(text(&output).contains("Q3Report"), "{output}");
+    assert!(text(&output).contains("季度报告与毛利率"), "{output}");
+}
+
+#[test]
 fn indirect_integers_resolve_in_every_direction() {
     let mut direct = Pdf::new();
     direct.object(CATALOG);

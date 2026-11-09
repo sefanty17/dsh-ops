@@ -20,9 +20,30 @@ await test('PDF capability stays discoverable and generates strict page/text/run
   assert.equal(entry.parameters.additionalProperties, false); assert.deepEqual(entry.parameters.required, ['path'])
   const schema = canonicalOutput('read_pdf'); assertSupportedJsonSchema(schema)
   assert.equal(schema.properties.items.items.properties.runs.items.type, 'string')
+  assert.equal(schema.properties.failedPages.items.properties.page.type, 'integer')
+  assert.equal(schema.properties.failedPages.items.properties.code.type, 'string')
+  assert.deepEqual(schema.properties.failedPages.items.required, ['page', 'code', 'message'])
+  // Native keeps page and code and clips the message, so one failed page cannot flood the line.
+  const failedLine = render({ failedPages: [{ page: 7, code: 'DOCUMENT_PARSE_ERROR', message: 'x'.repeat(200) }] })
+  assert.match(failedLine, /Failed pages: 7 DOCUMENT_PARSE_ERROR "x+/)
+  assert.ok(failedLine.includes('x'.repeat(119) + '…'), failedLine)
   assert.equal(schema.properties.items.items.properties.block, undefined); assert.equal(schema.properties.source.properties.pagesObserved.type, 'integer')
-  assert.match(jsonSchemaToTs(schema), /runs: string\[\]/); assert.match(entry.description, /images\/OCR/)
+  assert.match(jsonSchemaToTs(schema), /runs: string\[\]/); assert.match(entry.description, /encryption, scans rejected/)
 })
+await test('PDF text concatenates runs in content order without inferring separators', () => withTempDir('pdf-host-concat', async root => {
+  // Two shows on one page: the per-glyph shape that made a model read one glyph per line.
+  fs.writeFileSync(path.join(root, 'text.pdf'), textPdf(['BT /F1 12 Tf (Sef) Tj (anty) Tj ET']))
+  const { ctx, agent } = await documentHost(root, ['read_pdf'])
+  try {
+    const native = await agent('native')
+    await activateDocument(ctx, native, 'read_pdf')
+    const raw = await documentCall(ctx, native, 'read_pdf', { path: 'text.pdf' })
+    assert.deepEqual(raw.items, [{ page: 1, text: 'Sefanty', runs: ['Sef', 'anty'] }])
+    const text = render(raw)
+    assert.match(text, /Sefanty/)
+    assert.doesNotMatch(text, /Sef\s+anty/)
+  } finally { await shutdown(ctx) }
+}))
 await test('real PDF discovery activates next step for its owner and PTC pages preserve exact text runs', () => withTempDir('pdf-host-pages', async root => {
   const cwd = path.join(root, 'nested'); fs.mkdirSync(cwd)
   fs.writeFileSync(path.join(cwd, 'text.pdf'), textPdf([show('BM04 PDF text'), show(Buffer.from([0x80, 0x95, 0xa0]))], { deflate: true }))
@@ -46,20 +67,37 @@ await test('real PDF discovery activates next step for its owner and PTC pages p
     assert.deepEqual(tail.data.items[0], { page: 2, text: '€• ', runs: ['€• '] })
   } finally { await shutdown(ctx) }
 }))
-await test('unsupported later PDF pages retain only preceding complete pages and never resume the same gap', () => withTempDir('pdf-host-gap', async root => {
-  fs.writeFileSync(path.join(root, 'text.pdf'), textPdf([show('safe prefix'), show('not complete') + '/Im1 Do\n']))
+await test('a PDF gap outside the window leaves the window clean and never resumes the same gap', () => withTempDir('pdf-host-gap', async root => {
+  // A `BX` outside a text object is content this reader still refuses, so the failure needs no
+  // resource to raise: page 2 stays unsupported without depending on a declared XObject. A window
+  // that ends before it was never decoded, so page 1 keeps a complete scan, a total and a cursor.
+  fs.writeFileSync(path.join(root, 'text.pdf'), textPdf([show('safe prefix'), show('not complete') + 'BX weird EX\n']))
   const { ctx, agent } = await documentHost(root, ['read_pdf'])
   try {
     const native = await agent(), code = await agent('ptc')
     await activateDocument(ctx, native, 'read_pdf'); await activateDocument(ctx, code, 'read_pdf', 'ptc')
     const raw = await documentCall(ctx, native, 'read_pdf', { path: 'text.pdf', limit: 1 })
-    assert.equal(raw.scanComplete, false); assert.equal(raw.pageComplete, true); assert.equal(raw.pagesObserved, 1)
-    assert.equal(raw.total, undefined); assert.match(render(raw), /UNSUPPORTED_DOCUMENT/); assert.match(render(raw), /Page 1.*safe prefix/)
-    assert.match(render(raw), /not exhaustive/); assert.doesNotMatch(render(raw), /not complete/)
+    assert.equal(raw.scanComplete, true); assert.equal(raw.pageComplete, true); assert.equal(raw.pagesObserved, 1)
+    assert.equal(raw.total, 2); assert.equal(raw.nextOffset, 2)
+    const text = render(raw); assert.match(text, /Page 1.*safe prefix/); assert.doesNotMatch(text, /UNSUPPORTED_DOCUMENT/)
+    assert.doesNotMatch(text, /not exhaustive/); assert.doesNotMatch(text, /not complete/)
+    // Native names the failed page and its code even though the call is a partial observation.
+    const rawGap = await documentCall(ctx, native, 'read_pdf', { path: 'text.pdf', offset: 2, limit: 1 })
+    assert.equal(rawGap.status, 'partial'); assert.equal(rawGap.failedPages[0].page, 2)
+    const gapText = render(rawGap)
+    assert.match(gapText, /Failed pages: 2 UNSUPPORTED_DOCUMENT/)
+    assert.match(gapText, /not exhaustive/)
+    assert.match(gapText, /Unsupported PDF content operator BX/)
     const result = await documentCall(ctx, code, 'read_pdf', { path: 'text.pdf', limit: 1 })
-    assert.equal(result.status, 'error'); assert.equal(result.error.code, 'UNSUPPORTED_DOCUMENT'); assert.equal(result.error.retry, 'never')
-    assert.equal(result.continuation, undefined); assert.equal(result.data.items[0].text, 'safe prefix'); assert.equal(result.data.revision, undefined)
-    assert.match(result.error.nextAction, /page offsets do not bypass/)
+    assert.equal(result.status, 'partial'); assert.equal(result.error, undefined)
+    const next = decodeContinuation(result.continuation); assert.equal(next.tool, 'read_pdf'); assert.equal(next.args.offset, 2)
+    // Requesting the gap keeps the preceding observation but offers no cursor that could skip
+    // it; the retained data names the failed page even though the projection reports a partial
+    // result rather than the page's own code.
+    const gap = await documentCall(ctx, code, next.tool, next.args)
+    assert.equal(gap.status, 'error'); assert.equal(gap.error.code, 'RESULT_PARTIAL'); assert.equal(gap.continuation, undefined)
+    assert.equal(gap.data.failedPages[0].page, 2); assert.equal(gap.data.failedPages[0].code, 'UNSUPPORTED_DOCUMENT')
+    assert.match(gap.error.nextAction, /page offsets do not bypass/)
   } finally { await shutdown(ctx) }
 }))
 await test('PDF current credential policy and read-only authority survive decoding; malformed files stay errors', () => withTempDir('pdf-host-authority', async root => {
@@ -76,6 +114,11 @@ await test('PDF current credential policy and read-only authority survive decodi
     assert.equal(broken.status, 'error'); assert.equal(broken.error.code, 'DOCUMENT_PARSE_ERROR'); assert.equal(broken.continuation, undefined)
     const invalid = await documentCall(ctx, owner, 'read_pdf', { path: 'text.pdf', limit: 33 })
     assert.equal(invalid.error.code, 'INVALID_ARGUMENT'); assert.deepEqual(fs.readdirSync(root).sort(), before)
+    // A window that starts past the last page is an argument error, not a completed empty read.
+    const past = await documentCall(ctx, owner, 'read_pdf', { path: 'text.pdf', offset: 2 })
+    assert.equal(past.error.code, 'INVALID_ARGUMENT')
+    assert.match(past.error.message, /offset 2 exceeds the document's 1 pages/)
+    assert.equal(past.continuation, undefined); assert.deepEqual(fs.readdirSync(root).sort(), before)
   } finally { await shutdown(ctx) }
 }))
 await test('large PDF text and run data spill with original page scope and bounded Native output', () => withTempDir('pdf-host-spill', async root => {
@@ -84,7 +127,7 @@ await test('large PDF text and run data spill with original page scope and bound
   try {
     const owner = await agent(); await activateDocument(ctx, owner, 'read_pdf'); await activateDocument(ctx, owner, 'result')
     const raw = await documentCall(ctx, owner, 'read_pdf', { path: 'text.pdf' })
-    assert.equal(raw.reference.producerTool, 'read_pdf'); assert.equal(raw.scanComplete, true); assert.equal(raw.complete, false)
+    assert.equal(raw.reference.producerTool, 'read_pdf'); assert.equal(raw.scanComplete, false); assert.equal(raw.complete, false)
     const content = render(raw); assert.ok(Buffer.byteLength(JSON.stringify([{ type: 'text', text: content }])) <= 65536); assert.match(content, /ref:\/\//)
     const page = await documentCall(ctx, owner, 'result', { action: 'page', id: raw.reference.refId, root: raw.referenceRoot, limit: 1 })
     assert.equal(page.source.scope, 'page-text-layer-content-order'); assert.equal(page.source.pagesObserved, 1)

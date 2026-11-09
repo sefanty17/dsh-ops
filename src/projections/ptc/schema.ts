@@ -6,7 +6,7 @@ const object = (properties: Record<string, JsonSchemaNode>, required: string[]):
   ({ type: 'object', properties, required, additionalProperties: false })
 const coverage = (complete: boolean): JsonSchemaNode => object({ scannedFiles: integer, matchedCount: integer,
   isComplete: { type: 'boolean', const: complete },
-  truncatedBy: { type: 'string', enum: ['scan-budget', 'output-budget', 'time-limit', 'row-limit'] },
+  truncatedBy: { type: 'string', enum: ['scan-budget', 'output-budget', 'time-limit', 'row-limit', 'page-limit'] },
 }, ['scannedFiles', 'matchedCount', 'isComplete'])
 export const ERROR_SCHEMA = object({ code: string, message: string, nextAction: string,
   effectState: { type: 'string', enum: ['none', 'applied', 'partial', 'unknown'] },

@@ -21,7 +21,8 @@ function failure(data: CanonicalData | undefined, code: string, message: string,
 }
 function coverage(data: CanonicalData, complete: boolean): CoverageMeta {
   const cause = data.truncatedBy === 'time' ? 'time-limit' : data.truncatedBy
-  const truncatedBy = cause === 'scan-budget' || cause === 'output-budget' || cause === 'time-limit' || cause === 'row-limit'
+  const truncatedBy = cause === 'scan-budget' || cause === 'output-budget' || cause === 'time-limit'
+    || cause === 'row-limit' || cause === 'page-limit'
     ? cause : data.truncated === true ? 'output-budget' : undefined
   return { scannedFiles: count(data.scannedFiles), matchedCount: count(data.matchedObserved ?? data.matched ?? data.done),
     isComplete: complete, ...(truncatedBy ? { truncatedBy } : {}) }
@@ -71,8 +72,14 @@ export function toOutcome(tool: string, args: unknown, value: unknown): Outcome<
   if (incomplete) {
     const continuation = continuationFor(tool, args, data)
     if (continuation) return { status: 'partial', data, coverage: { ...coverage(data, false), isComplete: false }, continuation }
-    return failure(data, 'RESULT_PARTIAL', 'Observation is incomplete and has no safe continuation; refine the request.',
-      effect(data, count(data.changed) > 0 ? 'applied' : 'none'), next)
+    // A page-limited read is incomplete by a physical bound, not by request: no offset or limit
+    // reaches past it, so "refine the request" would send the caller after a cursor that cannot
+    // exist. `Outcome` requires a continuation on `partial`, and inventing one would fabricate a
+    // page the worker never offered, so this stays a retained-data failure.
+    return failure(data, 'RESULT_PARTIAL', data.truncatedBy === 'page-limit'
+      ? 'The file exceeds the 32-page physical read limit; only its leading pages are observable and no page offset reaches the rest. Use a dedicated PDF reader to read the whole file.'
+      : 'Observation is incomplete and has no safe continuation; refine the request.',
+    effect(data, count(data.changed) > 0 ? 'applied' : 'none'), next)
   }
   return { status: 'completed', data, ...(typeof data.scanComplete === 'boolean'
     ? { coverage: { ...coverage(data, true), isComplete: true as const } } : {}) }

@@ -14,7 +14,7 @@ export interface CoverageMeta {
   scannedFiles: number
   matchedCount: number
   isComplete: boolean
-  truncatedBy?: 'scan-budget' | 'output-budget' | 'time-limit' | 'row-limit'
+  truncatedBy?: 'scan-budget' | 'output-budget' | 'time-limit' | 'row-limit' | 'page-limit'
 }
 export type Outcome<T> =
   | { status: 'completed', data: T, coverage?: CoverageMeta & { isComplete: true } }
@@ -27,7 +27,7 @@ interface SearchReportBase {
   skippedFiles: number
   skipReasons: Record<string, number>
   matchedObserved: number
-  truncatedBy: 'scan-budget' | 'output-budget' | 'time' | 'row-limit' | 'none'
+  truncatedBy: 'scan-budget' | 'output-budget' | 'time' | 'row-limit' | 'page-limit' | 'none'
   continuation?: string
 }
 /** An early-stopped scan may report observed matches, never a claimed full-scan total. */
