@@ -7,6 +7,13 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- Read PDFs whose cross-reference offsets lead their object header by up to 32 whitespace bytes,
+  as Microsoft Print to PDF writes every in-use offset, instead of failing with `PDF xref must
+  point exactly to an object header`; reject an object header reached from any comment on its
+  line, even when `%` is not the line's first token (#646).
+- 读取 xref 偏移比对象头提前最多 32 个空白字节的 PDF（Microsoft Print to PDF 的每个在用偏移都如此），
+  不再以 `PDF xref must point exactly to an object header` 失败；对象头所在行只要 `%` 出现在头之前
+  （即使不是行首）就按注释拒绝（#646）。
 - Accept package-manager hardlinks only in rehashed Niubash source payloads while requiring exclusive execution copies; cover a real offline pnpm hardlink consumer and keep gate orchestration fixtures independent of a host Git Bash installation.
 - Niubash 源载荷逐字节校验后兼容包管理器硬链接，执行副本仍要求独占文件；增加真实离线 pnpm 硬链接消费者验证，并让门禁编排测试不依赖宿主 Git Bash 安装。
 
@@ -155,6 +162,25 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - 新增可选下载约束，由用户配置 Bash/PowerShell 替代下载命令，保守识别字面命令并覆盖真实 Native/PTC 派发。未配置、含歧义或流式输出的调用保持原状，绝不自动执行替代命令（#506）。
 - Inspect Windows Bash image and ancestor integrity labels in `ladder`, warn about Low labels, and keep unreadable labels and runtime health distinct from static payload compatibility (#446).
 - `ladder` 只读检查 Windows Bash 映像与祖先路径的完整性标签，告警 Low 标签，并区分不可读标签、运行时健康和静态载荷兼容性（#446）。
+
+- Read PDFs whose stream `/Length`, trailer `/Size` or page-tree `/Count` is an indirect
+  reference: resolve the chain through the xref table with bounded hops and cycle detection
+  instead of failing with "Expected a bounded nonnegative PDF integer" (#646).
+- 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
+  带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败（#646）。
+- Read PDFs with modern cross-reference structures: a cross-reference stream (`/Type /XRef` with
+  `/W` and `/Index`) and object streams (`/Type /ObjStm`) are decoded into the bounded object
+  table (#432, #646).
+- 读取采用现代交叉引用结构的 PDF：xref 流（`/Type /XRef`，含 `/W`、`/Index`）与对象流
+  （`/Type /ObjStm`）解码进同一张有界对象表（#432、#646）。
+- Bound object-stream expansion and nested object reads: an indirect `/N`, `/First` or stream
+  `/Length` that reaches another stream now stops at 8 nested object-stream expansions or 64
+  nested object reads, and an object stream that names itself or its own compressed object is
+  refused as cyclic. Malformed files return `OUTPUT_LIMIT` or `DOCUMENT_PARSE_ERROR` instead of
+  overflowing the worker stack (#646).
+- 对象流展开与嵌套对象读取的递归现在有界：间接 `/N`、`/First` 或流 `/Length` 指向另一条流时，
+  最多连续展开 8 层对象流或 64 层嵌套对象读取；对象流指向自身或其内部压缩对象时按循环结构
+  拒绝。畸形文件返回 `OUTPUT_LIMIT` 或 `DOCUMENT_PARSE_ERROR`，不再造成 worker 栈溢出（#646）。
 
 ## [0.5.0-alpha3] — 2026-10-30 — Unstable development prerelease
 

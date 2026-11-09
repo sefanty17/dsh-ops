@@ -2,10 +2,12 @@
 #![forbid(unsafe_code)]
 mod archive;
 mod pdf_syntax;
+mod pdf_limits;
 mod pdf_text;
 mod pdf;
 mod pdf_pages;
 pub mod pdf_container;
+mod pdf_xref;
 mod xml;
 mod docx;
 mod decode;
