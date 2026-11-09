@@ -1,22 +1,31 @@
-//! Bounded PDF container: classic xref tables and indirect object references.
+//! Bounded PDF container: classic xref tables, xref streams and object streams.
 use crate::pdf_syntax::{Dict, Lexer, MAX_NODES, Value, bad, limit, unsupported, white};
+use crate::pdf_xref::{XrefStream, object_stream, xref_stream};
 use ops_protocol::{Failure, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 pub const MAX_FILE: usize = 16 * 1024 * 1024;
 pub const MAX_OBJECTS: usize = 10_000;
 pub const MAX_STREAM: usize = 1024 * 1024;
+/// Decoded bytes of cross-reference streams and object streams, in aggregate.
+pub const MAX_XREF_DECODED: usize = 8 * 1024 * 1024;
+/// Objects one object stream may hold.
+pub const MAX_OBJECT_STREAM_OBJECTS: usize = 4096;
+/// Object streams one `/N` or `/First` chain may expand into.
+pub const MAX_OBJECT_STREAM_DEPTH: usize = 8;
 /// Objects one indirect `/Length` chain may keep in flight.
 const MAX_NESTED_OBJECT_READS: usize = 64;
 const CONTAINER_DEADLINE: Duration = Duration::from_secs(20);
 pub type ObjectId = (u32, u16);
-/// One cross-reference entry from a classic table.
+/// One cross-reference entry, from a classic table or a stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum XrefEntry {
     /// Type 0: the object number is not in use.
     Free { generation: u16 },
     /// Type 1: an object header at a byte offset.
     Offset { offset: usize, generation: u16 },
+    /// Type 2: the object is entry `index` of object stream `stream`.
+    Compressed { stream: u32, index: u32 },
 }
 #[derive(Debug)]
 pub struct Object<'a> {
@@ -108,10 +117,38 @@ fn check_deadline(started: Instant) -> Result<()> {
 pub(crate) struct Raw<'a> {
     pub(crate) value: Value,
     pub(crate) stream: Option<&'a [u8]>,
-    /// Where the object header starts.
+    /// Where the object header actually starts, after any tolerated leading whitespace.
     pub(crate) start: usize,
     pub(crate) end: usize,
     nodes: usize,
+}
+/// Whitespace bytes a cross-reference offset may lead its object header by. Microsoft Print to
+/// PDF records every in-use offset one byte short, at the line feed before the header.
+const MAX_HEADER_LEAD: usize = 32;
+/// True when a `%` outside a literal string starts a comment before `header`. String content such
+/// as `(100%)` is data, not a comment, so it cannot hide the header; `endobj % 1 0 obj` is refused.
+fn comment_before(data: &[u8], line_start: usize, header: usize) -> bool {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for byte in data[line_start..header].iter().copied() {
+        if depth == 0 {
+            match byte {
+                b'(' => depth = 1,
+                b'%' => return true,
+                _ => {}
+            }
+        } else if escaped {
+            escaped = false;
+        } else {
+            match byte {
+                b'\\' => escaped = true,
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 /// Read the object at offset; /Length is the only value read before the object is complete.
 pub(crate) fn read_object<'a>(
@@ -120,30 +157,36 @@ pub(crate) fn read_object<'a>(
     expected: Option<ObjectId>,
     length: &mut dyn FnMut(&Value) -> Result<usize>,
 ) -> Result<Raw<'a>> {
-    if !data.get(offset).is_some_and(u8::is_ascii_digit) {
+    // Only leading whitespace is tolerated before the header: an offset that names anything else,
+    // or that leads the header by more than MAX_HEADER_LEAD bytes, is the original failure.
+    let mut header = offset;
+    while header - offset < MAX_HEADER_LEAD && data.get(header).is_some_and(|byte| white(*byte)) {
+        header += 1;
+    }
+    if !data.get(header).is_some_and(u8::is_ascii_digit) {
         return Err(bad("PDF xref must point exactly to an object header"));
     }
-    if offset == 0 {
+    if header == 0 {
         return Err(bad("PDF object header must follow whitespace"));
     }
     // A % starts a comment to the line end, so anything after one is comment text; an object
     // header cannot be introduced from inside a comment, even when the % is not the line's first
-    // token.
-    let line_start = data[..offset]
+    // token. Literal-string bytes are skipped so a value such as `(100%)` stays data.
+    let line_start = data[..header]
         .iter()
         .rposition(|byte| matches!(byte, b'\n' | b'\r'))
         .map_or(0, |at| at + 1);
-    if data[line_start..offset].contains(&b'%') {
+    if comment_before(data, line_start, header) {
         return Err(bad(
             "PDF object header must follow whitespace; a comment cannot introduce an object",
         ));
     }
-    if !white(data[offset - 1]) {
+    if !white(data[header - 1]) {
         return Err(bad("PDF object header must follow whitespace"));
     }
     let mut lexer = Lexer {
         data,
-        at: offset,
+        at: header,
         nodes: 0,
     };
     let number = lexer.unsigned()?;
@@ -188,7 +231,7 @@ pub(crate) fn read_object<'a>(
     Ok(Raw {
         value,
         stream,
-        start: offset,
+        start: header,
         end: lexer.at,
         nodes: lexer.nodes,
     })
@@ -197,6 +240,8 @@ pub(crate) fn read_object<'a>(
 struct Section {
     entries: BTreeMap<usize, XrefEntry>,
     trailer: Dict,
+    /// True when this section is a cross-reference stream rather than a classic table.
+    stream: bool,
 }
 /// Refuse a trailer that names `/Prev` or `/XRefStm`; both mark an incremental update.
 fn reject_incremental_trailer(trailer: &Dict) -> Result<()> {
@@ -216,12 +261,11 @@ fn read_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Secti
     if !white(data[offset - 1]) {
         return Err(bad("PDF xref section must follow whitespace"));
     }
-    if !data[offset..].starts_with(b"xref") {
-        return Err(unsupported(
-            "PDF requires a classic xref table; xref streams are unsupported",
-        ));
+    if data[offset..].starts_with(b"xref") {
+        classic_section(data, offset, footer_start)
+    } else {
+        stream_section(data, offset, footer_start)
     }
-    classic_section(data, offset, footer_start)
 }
 fn classic_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Section> {
     let mut lexer = Lexer {
@@ -280,7 +324,30 @@ fn classic_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Se
     };
     reject_incremental_trailer(&trailer)?;
     finish_section(&mut lexer, footer_start)?;
-    Ok(Section { entries, trailer })
+    Ok(Section {
+        entries,
+        trailer,
+        stream: false,
+    })
+}
+fn stream_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Section> {
+    let XrefStream {
+        entries,
+        trailer,
+        end,
+    } = xref_stream(data, offset)?;
+    reject_incremental_trailer(&trailer)?;
+    let mut lexer = Lexer {
+        data,
+        at: end,
+        nodes: 0,
+    };
+    finish_section(&mut lexer, footer_start)?;
+    Ok(Section {
+        entries,
+        trailer,
+        stream: true,
+    })
 }
 /// Verify that the section ends at the final footer: nothing follows the only revision.
 fn finish_section(lexer: &mut Lexer<'_>, footer_start: usize) -> Result<()> {
@@ -295,8 +362,13 @@ struct Loader<'a> {
     data: &'a [u8],
     entries: BTreeMap<usize, XrefEntry>,
     objects: BTreeMap<ObjectId, Object<'a>>,
+    expanded: BTreeMap<u32, Vec<(u32, Value)>>,
     ranges: Vec<(usize, usize)>,
     resolving: BTreeSet<ObjectId>,
+    /// Object streams whose `/N` and `/First` are being resolved. Its length is the current
+    /// expansion depth.
+    expanding: BTreeSet<u32>,
+    decoded: usize,
     nodes: usize,
     started: Instant,
 }
@@ -355,6 +427,23 @@ impl<'a> Loader<'a> {
                 self.object_at(id, offset)?;
                 Ok(self.objects[&id].value.clone())
             }
+            XrefEntry::Compressed { stream, index } => {
+                if id.1 != 0 {
+                    return Err(bad(
+                        "PDF compressed object references must use generation zero",
+                    ));
+                }
+                self.expand(stream)?;
+                let Some((number, value)) = self.expanded[&stream].get(index as usize) else {
+                    return Err(bad("PDF object stream index is out of range"));
+                };
+                if *number != id.0 {
+                    return Err(bad(
+                        "PDF object stream entry does not name the referenced object",
+                    ));
+                }
+                Ok(value.clone())
+            }
             XrefEntry::Free { .. } => Err(bad("PDF reference does not name an active xref object")),
         }
     }
@@ -389,9 +478,79 @@ impl<'a> Loader<'a> {
         );
         Ok(())
     }
+    /// Expand one `/Type /ObjStm` stream; `expanding` records in-progress streams, so a reference back is a cycle.
+    fn expand(&mut self, stream: u32) -> Result<()> {
+        if self.expanded.contains_key(&stream) {
+            return Ok(());
+        }
+        check_deadline(self.started)?;
+        if self.expanding.contains(&stream) {
+            return Err(bad(
+                "Cyclic PDF object stream expansion through /N or /First",
+            ));
+        }
+        if self.expanding.len() >= MAX_OBJECT_STREAM_DEPTH {
+            return Err(Failure::new(
+                "OUTPUT_LIMIT",
+                format!(
+                    "PDF object stream expansion exceeds {MAX_OBJECT_STREAM_DEPTH} nested streams"
+                ),
+            ));
+        }
+        self.expanding.insert(stream);
+        let result = self.expand_stream(stream);
+        self.expanding.remove(&stream);
+        result
+    }
+    /// Expand `stream`; [`Loader::expand`] owns the cycle and depth guard.
+    fn expand_stream(&mut self, stream: u32) -> Result<()> {
+        let id = (stream, 0u16);
+        let offset = match *self
+            .entries
+            .get(&(stream as usize))
+            .ok_or_else(|| bad("PDF object stream does not name an active xref entry"))?
+        {
+            XrefEntry::Offset { offset, generation: 0 } => offset,
+            _ => {
+                return Err(bad(
+                    "PDF object stream must be an uncompressed generation-zero object",
+                ));
+            }
+        };
+        self.object_at(id, offset)?;
+        let (count, first) = {
+            let object = &self.objects[&id];
+            let dict = object.value.dict()?;
+            if get(dict, b"Type")?.name()? != b"ObjStm" {
+                return Err(bad("PDF object stream object must have Type /ObjStm"));
+            }
+            (get(dict, b"N")?.clone(), get(dict, b"First")?.clone())
+        };
+        let count = self.length_of(&count)?;
+        let first = self.length_of(&first)?;
+        if count > MAX_OBJECT_STREAM_OBJECTS {
+            return Err(limit("PDF object stream exceeds 4096 objects"));
+        }
+        let decoded = {
+            let object = &self.objects[&id];
+            decode(object)?
+        };
+        self.decoded = self.decoded.saturating_add(decoded.len());
+        if self.decoded > MAX_XREF_DECODED {
+            return Err(limit("PDF decoded xref and object streams exceed 8 MiB"));
+        }
+        let mut charge = |nodes: usize| self.charge(nodes);
+        let values = object_stream(&decoded, count, first, &mut charge)?;
+        self.expanded.insert(stream, values);
+        Ok(())
+    }
 }
 /// Reject overlapping ranges; the header region must not contain unindexed data.
-fn verify_ranges(data: &[u8], mut ranges: Vec<(usize, usize)>, footer_start: usize) -> Result<()> {
+fn verify_ranges(
+    data: &[u8],
+    mut ranges: Vec<(usize, usize)>,
+    footer_start: usize,
+) -> Result<()> {
     ranges.sort_unstable();
     if let Some((first, _)) = ranges.first() {
         let mut gap = Lexer::new(data);
@@ -429,14 +588,21 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
     let (startxref, footer_start) = footer(data)?;
     let started = Instant::now();
     check_deadline(started)?;
-    let Section { entries, trailer } = read_section(data, startxref, footer_start)?;
+    let Section {
+        entries,
+        trailer,
+        stream: sparse,
+    } = read_section(data, startxref, footer_start)?;
     let mut ranges = vec![(startxref, footer_start)];
     let mut loader = Loader {
         data,
         entries,
         objects: BTreeMap::new(),
+        expanded: BTreeMap::new(),
         ranges: Vec::new(),
         resolving: BTreeSet::new(),
+        expanding: BTreeSet::new(),
+        decoded: 0,
         nodes: 0,
         started,
     };
@@ -451,20 +617,23 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         return Err(limit("PDF Size exceeds 10000 objects"));
     }
     if loader.entries.keys().any(|number| *number >= size) {
-        return Err(bad("PDF xref declares an object number at or above Size"));
+        return Err(bad(
+            "PDF xref declares an object number at or above Size",
+        ));
     }
-    // A classic table must declare every object number below Size.
-    if loader.entries.len() != size {
+    // A classic table must declare every number below Size; a cross-reference stream may leave
+    // holes (its `/Index` need not be contiguous), which then fail only when referenced.
+    if !sparse && loader.entries.len() != size {
         return Err(bad(
             "PDF classic xref must declare every object number below Size",
         ));
     }
-    if loader.entries.get(&0).copied().is_none_or(|entry| {
-        entry
-            != XrefEntry::Free {
-                generation: u16::MAX,
-            }
-    }) {
+    if loader
+        .entries
+        .get(&0)
+        .copied()
+        .is_none_or(|entry| entry != XrefEntry::Free { generation: u16::MAX })
+    {
         return Err(bad("PDF object zero must be free with generation 65535"));
     }
     let root = trailer
@@ -485,15 +654,37 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
             XrefEntry::Free { .. } => {}
             XrefEntry::Offset { offset, generation } => {
                 if *offset < 9 || *offset >= footer_start {
-                    return Err(bad(
-                        "Active PDF object offset is outside the object section",
-                    ));
+                    return Err(bad("Active PDF object offset is outside the object section"));
                 }
                 loader.object_at((*number as u32, *generation), *offset)?;
             }
+            XrefEntry::Compressed { stream, index } => {
+                let _ = index;
+                loader.expand(*stream)?;
+            }
         }
     }
-    let objects = loader.objects;
+    let mut objects = loader.objects;
+    for (number, entry) in &pending {
+        let XrefEntry::Compressed { stream, index } = entry else {
+            continue;
+        };
+        let Some((named, value)) = loader.expanded[stream].get(*index as usize) else {
+            return Err(bad("PDF object stream index is out of range"));
+        };
+        if *named != *number as u32 {
+            return Err(bad(
+                "PDF object stream entry does not name the referenced object",
+            ));
+        }
+        objects.insert(
+            (*number as u32, 0),
+            Object {
+                value: value.clone(),
+                stream: None,
+            },
+        );
+    }
     ranges.append(&mut loader.ranges);
     verify_ranges(data, ranges, footer_start)?;
     let document = Document { objects, root };
