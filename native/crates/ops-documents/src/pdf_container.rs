@@ -1,19 +1,5 @@
-//! A deliberately restricted PDF container: one classic xref table or one cross-reference
-//! stream, plus object streams.
-//!
-//! Every structure is bounded before it is trusted: a 16 MiB file, 10 000 objects, 1 MiB per
-//! encoded or decoded stream, 8 MiB of decoded xref and object streams, 4096 objects per object
-//! stream, eight nested object-stream expansions, 64 nested object reads, and a 20-second
-//! container deadline. A malformed structure is a structured failure, never a recovered guess.
-//!
-//! Exactly one cross-reference section is read, and it must end at the final footer. A trailer
-//! that names `/Prev` or `/XRefStm` describes an incremental update, which this container
-//! refuses (#432): superseded object bytes stay in the file, so following the earlier section
-//! would be a different, unsupported format. Parsed object ranges must stay disjoint from each
-//! other and from the xref section.
-//!
-//! The sibling `pdf_xref` module decodes cross-reference stream and object stream bytes; this
-//! module owns the document frame around them: footer, classic tables, the loader and ranges.
+//! Bounded PDF container: classic xref tables, xref streams, object streams, incremental updates.
+use crate::pdf_predictor::decode_parms;
 use crate::pdf_syntax::{Dict, Lexer, MAX_NODES, Value, bad, limit, unsupported, white};
 use crate::pdf_xref::{XrefStream, object_stream, xref_stream};
 use ops_protocol::{Failure, Result};
@@ -22,16 +8,15 @@ use std::time::{Duration, Instant};
 pub const MAX_FILE: usize = 16 * 1024 * 1024;
 pub const MAX_OBJECTS: usize = 10_000;
 pub const MAX_STREAM: usize = 1024 * 1024;
+/// Cross-reference sections read through one /Prev chain.
+pub const MAX_SECTIONS: usize = 64;
 /// Decoded bytes of cross-reference streams and object streams, in aggregate.
 pub const MAX_XREF_DECODED: usize = 8 * 1024 * 1024;
 /// Objects one object stream may hold.
 pub const MAX_OBJECT_STREAM_OBJECTS: usize = 4096;
-/// Object streams one `/N` or `/First` chain may expand into each other. Both values are direct
-/// integers in every supported producer; an indirect one that reaches another object stream is
-/// bounded instead of recursing.
+/// Object streams that nested /N or /First chains may expand into each other.
 pub const MAX_OBJECT_STREAM_DEPTH: usize = 8;
-/// Objects one indirect `/Length` chain may hold in flight. Parsing a referenced stream resolves
-/// its own `/Length` first, so each link nests one read.
+/// Objects one indirect /Length chain may hold in flight, one per nesting link.
 const MAX_NESTED_OBJECT_READS: usize = 64;
 const CONTAINER_DEADLINE: Duration = Duration::from_secs(20);
 pub type ObjectId = (u32, u16);
@@ -42,25 +27,34 @@ pub(crate) enum XrefEntry {
     Free { generation: u16 },
     /// Type 1: an object header at a byte offset.
     Offset { offset: usize, generation: u16 },
-    /// Type 2: the object is entry `index` of object stream `stream`.
+    /// Type 2: entry index of object stream stream.
     Compressed { stream: u32, index: u32 },
 }
+impl XrefEntry {
+    fn active(self) -> bool {
+        !matches!(self, Self::Free { .. })
+    }
+}
+/// One object read from the file; a stream's bytes are never decoded here.
 #[derive(Debug)]
 pub struct Object<'a> {
     pub value: Value,
     pub stream: Option<&'a [u8]>,
 }
+/// The container: every object the chain reached, plus the trailer's /Root.
 #[derive(Debug)]
 pub struct Document<'a> {
     pub objects: BTreeMap<ObjectId, Object<'a>>,
     pub root: ObjectId,
 }
 impl<'a> Document<'a> {
+    /// The object at id; a free entry or a number outside the chain is DOCUMENT_PARSE_ERROR.
     pub fn object(&self, id: ObjectId) -> Result<&Object<'a>> {
         self.objects
             .get(&id)
             .ok_or_else(|| bad("PDF reference does not name an active object"))
     }
+    /// Follow indirect references to their plain value; cycles, streams and chains over 64 fail.
     pub fn resolve<'b>(&'b self, value: &'b Value) -> Result<&'b Value> {
         let mut current = value;
         let mut seen = BTreeSet::new();
@@ -80,6 +74,7 @@ impl<'a> Document<'a> {
         Ok(current)
     }
 }
+/// The value at key, for an entry the format requires; a missing key is DOCUMENT_PARSE_ERROR.
 pub fn get<'a>(dict: &'a Dict, key: &[u8]) -> Result<&'a Value> {
     dict.get(key)
         .ok_or_else(|| bad(format!("Missing PDF {}", String::from_utf8_lossy(key))))
@@ -145,6 +140,8 @@ pub(crate) struct Raw<'a> {
 const MAX_HEADER_LEAD: usize = 32;
 /// True when a `%` outside a literal string starts a comment before `header`. String content such
 /// as `(100%)` is data, not a comment, so it cannot hide the header; `endobj % 1 0 obj` is refused.
+/// Only a string opened on this line is tracked: bytes of a string continued from an earlier line
+/// are classified as outside a string.
 fn comment_before(data: &[u8], line_start: usize, header: usize) -> bool {
     let mut depth = 0usize;
     let mut escaped = false;
@@ -254,30 +251,51 @@ pub(crate) fn read_object<'a>(
         nodes: lexer.nodes,
     })
 }
-/// The one cross-reference section the file names from its footer.
+/// One cross-reference section: its entries, trailer and the next older section.
 struct Section {
     entries: BTreeMap<usize, XrefEntry>,
     trailer: Dict,
+    /// /Prev: the byte offset of the next older cross-reference section.
+    prev: Option<usize>,
+    /// /XRefStm: the hybrid cross-reference stream that supplements this classic table.
+    xref_stm: Option<usize>,
     /// True when this section is a cross-reference stream rather than a classic table.
     stream: bool,
+    /// Decoded bytes of a cross-reference stream; a classic table decodes none.
+    decoded: usize,
+    /// Byte just after the section's trailer, or after its %%EOF when another section follows.
+    end: usize,
 }
-/// Refuse a trailer that names an earlier cross-reference section.
-///
-/// `/Prev` and `/XRefStm` describe an incremental update only as trailer keys; the same names
-/// inside a page or outline dictionary are ordinary data. A file with either key keeps
-/// superseded object bytes, so reading it is a different format than the single-revision
-/// container below resolves.
-fn reject_incremental_trailer(trailer: &Dict) -> Result<()> {
-    for key in [b"Prev".as_slice(), b"XRefStm"] {
-        if trailer.contains_key(key) {
-            return Err(unsupported(
-                "Incremental PDF updates with a trailer /Prev or /XRefStm are unsupported",
-            ));
+/// A trailer integer that names another section, as a direct bounded offset.
+fn optional_offset(dict: &Dict, key: &[u8]) -> Result<Option<usize>> {
+    match dict.get(key) {
+        None => Ok(None),
+        Some(value) => value.integer().map(Some),
+    }
+}
+/// Merge a hybrid /XRefStm table into its classic one; disagreeing in-use entries are a failure.
+fn merge_hybrid(
+    entries: &mut BTreeMap<usize, XrefEntry>,
+    extra: BTreeMap<usize, XrefEntry>,
+) -> Result<()> {
+    for (number, entry) in extra {
+        match entries.get(&number).copied() {
+            None => {
+                entries.insert(number, entry);
+            }
+            Some(existing) if existing == entry => {}
+            Some(existing) if existing.active() && entry.active() => {
+                return Err(bad("PDF hybrid xref entries disagree for one object"));
+            }
+            Some(existing) if !existing.active() => {
+                entries.insert(number, entry);
+            }
+            Some(_) => {}
         }
     }
     Ok(())
 }
-fn read_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Section> {
+fn read_section(data: &[u8], offset: usize, last: bool, footer_start: usize) -> Result<Section> {
     if offset < 9 || offset >= footer_start {
         return Err(bad("PDF xref offset points outside the object section"));
     }
@@ -285,12 +303,17 @@ fn read_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Secti
         return Err(bad("PDF xref section must follow whitespace"));
     }
     if data[offset..].starts_with(b"xref") {
-        classic_section(data, offset, footer_start)
+        classic_section(data, offset, last, footer_start)
     } else {
-        stream_section(data, offset, footer_start)
+        stream_section(data, offset, last, footer_start)
     }
 }
-fn classic_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Section> {
+fn classic_section(
+    data: &[u8],
+    offset: usize,
+    last: bool,
+    footer_start: usize,
+) -> Result<Section> {
     let mut lexer = Lexer {
         data,
         at: offset,
@@ -306,15 +329,14 @@ fn classic_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Se
         }
         let start = lexer.unsigned()?;
         let count = lexer.unsigned()?;
-        // Every incremental update starts with an empty subsection; declaring nothing is not a
-        // section of this container, and skipping it is not recovery.
-        if count == 0 {
-            return Err(bad("PDF xref subsection cannot be empty"));
+        if start >= MAX_OBJECTS || count > MAX_OBJECTS - start {
+            return Err(limit("PDF xref exceeds 10000 entries"));
         }
-        if start >= MAX_OBJECTS
-            || count > MAX_OBJECTS - start
-            || entries.len() + count > MAX_OBJECTS
-        {
+        // An empty subsection declares nothing; every incremental update ends with one.
+        if count == 0 {
+            continue;
+        }
+        if entries.len() + count > MAX_OBJECTS {
             return Err(limit("PDF xref exceeds 10000 entries"));
         }
         for id in start..start + count {
@@ -345,40 +367,79 @@ fn classic_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Se
     let Value::Dict(trailer) = lexer.value(0)? else {
         return Err(bad("Expected a PDF dictionary"));
     };
-    reject_incremental_trailer(&trailer)?;
-    finish_section(&mut lexer, footer_start)?;
+    // /Prev and /XRefStm mean earlier structure only as trailer keys; elsewhere they are data.
+    let prev = optional_offset(&trailer, b"Prev")?;
+    let xref_stm = optional_offset(&trailer, b"XRefStm")?;
+    let end = finish_section(&mut lexer, offset, last, footer_start)?;
     Ok(Section {
         entries,
         trailer,
+        prev,
+        xref_stm,
         stream: false,
+        decoded: 0,
+        end,
     })
 }
-fn stream_section(data: &[u8], offset: usize, footer_start: usize) -> Result<Section> {
+fn stream_section(data: &[u8], offset: usize, last: bool, footer_start: usize) -> Result<Section> {
     let XrefStream {
         entries,
         trailer,
         end,
+        decoded,
     } = xref_stream(data, offset)?;
-    reject_incremental_trailer(&trailer)?;
+    if trailer.contains_key(b"XRefStm".as_slice()) {
+        return Err(bad("PDF xref stream cannot contain another /XRefStm"));
+    }
+    let prev = optional_offset(&trailer, b"Prev")?;
     let mut lexer = Lexer {
         data,
         at: end,
         nodes: 0,
     };
-    finish_section(&mut lexer, footer_start)?;
+    let end = finish_section(&mut lexer, offset, last, footer_start)?;
     Ok(Section {
         entries,
         trailer,
+        prev,
+        xref_stm: None,
         stream: true,
+        decoded,
+        end,
     })
 }
-/// Verify that the section ends at the final footer: nothing follows the only revision.
-fn finish_section(lexer: &mut Lexer<'_>, footer_start: usize) -> Result<()> {
+/// Verify the section's startxref and %%EOF, and return where its bytes end.
+fn finish_section(
+    lexer: &mut Lexer<'_>,
+    offset: usize,
+    last: bool,
+    footer_start: usize,
+) -> Result<usize> {
     lexer.skip();
-    if lexer.at != footer_start {
-        return Err(bad("Unexpected PDF data between trailer and final footer"));
+    if last {
+        if lexer.at != footer_start {
+            return Err(bad("Unexpected PDF data between trailer and final footer"));
+        }
+        return Ok(footer_start);
     }
-    Ok(())
+    if lexer.word()? != b"startxref" {
+        return Err(bad("PDF incremental section must be followed by startxref"));
+    }
+    if lexer.unsigned()? != offset {
+        return Err(bad(
+            "PDF incremental startxref must name the section that follows it",
+        ));
+    }
+    // %%EOF starts with '%', which the whitespace skipper would consume as a comment.
+    let mut at = lexer.at;
+    while at < lexer.data.len() && white(lexer.data[at]) {
+        at += 1;
+    }
+    if !lexer.data[at..].starts_with(b"%%EOF") {
+        return Err(bad("Missing PDF %%EOF after an incremental section"));
+    }
+    lexer.at = at + 5;
+    Ok(lexer.at)
 }
 /// Parsed object values plus their resolution budgets.
 struct Loader<'a> {
@@ -388,8 +449,7 @@ struct Loader<'a> {
     expanded: BTreeMap<u32, Vec<(u32, Value)>>,
     ranges: Vec<(usize, usize)>,
     resolving: BTreeSet<ObjectId>,
-    /// Object streams whose `/N` and `/First` are being resolved. Its length is the current
-    /// expansion depth.
+    /// Object streams whose /N and /First are being resolved; its length is the expansion depth.
     expanding: BTreeSet<u32>,
     decoded: usize,
     nodes: usize,
@@ -415,7 +475,7 @@ impl<'a> Loader<'a> {
         }
         Ok(entry)
     }
-    /// Resolve a value that `/Length`, `/N`, `/First` and `/Size` may write as a reference chain.
+    /// Resolve a value that /Length, /N, /First and /Size may write as a reference chain.
     fn length_of(&mut self, value: &Value) -> Result<usize> {
         if !matches!(value, Value::Ref(..)) {
             return value.integer();
@@ -501,12 +561,8 @@ impl<'a> Loader<'a> {
         );
         Ok(())
     }
-    /// Expand one `/Type /ObjStm` stream into its inner objects, in stream order.
-    ///
-    /// `/N` and `/First` may be indirect and may name an object another object stream holds, so
-    /// expansion re-enters here. `expanding` records every stream whose expansion is in progress
-    /// before any of its values is resolved: a reference back into one of them is a cycle, and its
-    /// length is the nesting depth this method bounds.
+    /// Expand one /Type /ObjStm stream into its inner objects, in stream order; /N and /First may
+    /// name another object stream, so in-progress streams are recorded before their values resolve.
     fn expand(&mut self, stream: u32) -> Result<()> {
         if self.expanded.contains_key(&stream) {
             return Ok(());
@@ -530,7 +586,7 @@ impl<'a> Loader<'a> {
         self.expanding.remove(&stream);
         result
     }
-    /// Expand `stream`; [`Loader::expand`] owns the cycle and depth guard.
+    /// Expand stream; Loader::expand owns the cycle and depth guard.
     fn expand_stream(&mut self, stream: u32) -> Result<()> {
         let id = (stream, 0u16);
         let offset = match *self
@@ -574,10 +630,7 @@ impl<'a> Loader<'a> {
     }
 }
 /// Reject ranges that overlap: an xref offset is an object header, never a byte inside one.
-///
-/// The header region is checked separately: before the first indexed construct a PDF has its
-/// version line and at most a comment line, and anything else there is unindexed data rather
-/// than part of the document. Gaps between indexed constructs are not read.
+/// Bytes before the first indexed construct are only the version line and at most one comment.
 fn verify_ranges(
     data: &[u8],
     mut ranges: Vec<(usize, usize)>,
@@ -604,6 +657,8 @@ fn verify_ranges(
     }
     Ok(())
 }
+/// Parse the file into its objects from startxref; a structural mismatch is DOCUMENT_PARSE_ERROR,
+/// a version outside 1.0-1.7 UNSUPPORTED_DOCUMENT, a size, section or decode bound OUTPUT_LIMIT.
 pub fn parse(data: &[u8]) -> Result<Document<'_>> {
     if data.len() > MAX_FILE {
         return Err(limit("PDF file exceeds 16 MiB"));
@@ -620,12 +675,84 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
     let (startxref, footer_start) = footer(data)?;
     let started = Instant::now();
     check_deadline(started)?;
-    let Section {
-        entries,
-        trailer,
-        stream: sparse,
-    } = read_section(data, startxref, footer_start)?;
-    let mut ranges = vec![(startxref, footer_start)];
+    let mut sections: Vec<Section> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut ranges = Vec::new();
+    // A cross-reference stream may leave /Index holes; a classic-only chain declares every number.
+    let mut sparse = false;
+    let mut decoded = 0usize;
+    let mut cursor = Some(startxref);
+    while let Some(offset) = cursor {
+        if sections.len() >= MAX_SECTIONS {
+            return Err(limit("PDF xref chain exceeds 64 sections"));
+        }
+        check_deadline(started)?;
+        if !seen.insert(offset) {
+            return Err(bad("Cyclic PDF xref /Prev chain"));
+        }
+        let last = sections.is_empty();
+        let mut section = read_section(data, offset, last, footer_start)?;
+        ranges.push((offset, section.end));
+        sparse |= section.stream;
+        decoded = decoded.saturating_add(section.decoded);
+        if let Some(hybrid) = section.xref_stm.take() {
+            check_deadline(started)?;
+            let table = xref_stream(data, hybrid)?;
+            ranges.push((hybrid, table.end));
+            sparse = true;
+            decoded = decoded.saturating_add(table.decoded);
+            if table.trailer.contains_key(b"XRefStm".as_slice()) {
+                return Err(bad("PDF xref stream cannot contain another /XRefStm"));
+            }
+            let hybrid_prev = optional_offset(&table.trailer, b"Prev")?;
+            merge_hybrid(&mut section.entries, table.entries)?;
+            section.prev = match (section.prev, hybrid_prev) {
+                (Some(current), Some(hybrid)) if current != hybrid => {
+                    return Err(bad(
+                        "PDF hybrid trailer and its xref stream disagree on /Prev",
+                    ));
+                }
+                (current, hybrid) => current.or(hybrid),
+            };
+        }
+        if decoded > MAX_XREF_DECODED {
+            return Err(limit("PDF decoded xref and object streams exceed 8 MiB"));
+        }
+        cursor = match section.prev {
+            Some(prev) => {
+                if seen.contains(&prev) {
+                    return Err(bad("Cyclic PDF xref /Prev chain"));
+                }
+                if prev >= offset {
+                    return Err(bad("PDF /Prev must name an earlier xref section"));
+                }
+                Some(prev)
+            }
+            None => None,
+        };
+        sections.push(section);
+    }
+    // Newest sections are merged first, so an older entry never overrides a newer one.
+    let mut entries: BTreeMap<usize, XrefEntry> = BTreeMap::new();
+    for section in &sections {
+        for (number, entry) in &section.entries {
+            entries.entry(*number).or_insert(*entry);
+        }
+    }
+    // A trailer key comes from the newest revision that declares it.
+    let size_value = sections
+        .iter()
+        .find_map(|section| section.trailer.get(b"Size".as_slice()))
+        .ok_or_else(|| bad("Missing PDF Size"))?
+        .clone();
+    let root = sections
+        .iter()
+        .find_map(|section| section.trailer.get(b"Root".as_slice()))
+        .ok_or_else(|| bad("Missing PDF Root"))?;
+    let root = match root {
+        Value::Ref(a, b) => (*a, *b),
+        _ => return Err(bad("PDF Root must be an indirect reference")),
+    };
     let mut loader = Loader {
         data,
         entries,
@@ -634,14 +761,11 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         ranges: Vec::new(),
         resolving: BTreeSet::new(),
         expanding: BTreeSet::new(),
-        decoded: 0,
+        decoded,
         nodes: 0,
         started,
     };
-    let size = {
-        let size = get(&trailer, b"Size")?.clone();
-        loader.length_of(&size)?
-    };
+    let size = loader.length_of(&size_value)?;
     if size == 0 {
         return Err(bad("PDF Size must name at least object zero"));
     }
@@ -653,28 +777,22 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
             "PDF xref declares an object number at or above Size",
         ));
     }
-    // A classic table must declare every number below Size; a cross-reference stream may leave
-    // holes (its `/Index` need not be contiguous), which then fail only when referenced.
+    // A classic table declares every number below Size; a stream may leave holes until referenced.
     if !sparse && loader.entries.len() != size {
         return Err(bad(
             "PDF classic xref must declare every object number below Size",
         ));
     }
-    if loader
-        .entries
-        .get(&0)
-        .copied()
-        .is_none_or(|entry| entry != XrefEntry::Free { generation: u16::MAX })
-    {
+    // Object zero heads the free list, so the newest declaration decides; a classic table spells
+    // generation as 65535, while a stream's narrow /W field can only hold 255.
+    let zero = loader.entries.get(&0).copied();
+    if sparse {
+        if !matches!(zero, Some(XrefEntry::Free { .. })) {
+            return Err(bad("PDF object zero must be a free entry"));
+        }
+    } else if zero != Some(XrefEntry::Free { generation: u16::MAX }) {
         return Err(bad("PDF object zero must be free with generation 65535"));
     }
-    let root = trailer
-        .get(b"Root".as_slice())
-        .ok_or_else(|| bad("Missing PDF Root"))?;
-    let root = match root {
-        Value::Ref(a, b) => (*a, *b),
-        _ => return Err(bad("PDF Root must be an indirect reference")),
-    };
     let pending: Vec<(usize, XrefEntry)> = loader
         .entries
         .iter()
@@ -727,19 +845,24 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
     root_object.value.dict()?;
     Ok(document)
 }
-// Decode one already bounded stream; verify the actual zlib terminator and complete input consumption.
+/// Decode one stream object through its /Filter; another filter or external /F bytes are
+/// UNSUPPORTED_DOCUMENT, a bound overrun OUTPUT_LIMIT, and malformed zlib a parse error.
 pub fn decode(object: &Object<'_>) -> Result<Vec<u8>> {
     let raw = object.stream.ok_or_else(|| bad("Expected a PDF stream"))?;
     if raw.len() > MAX_STREAM {
         return Err(limit("PDF encoded stream exceeds 1 MiB"));
     }
     let dict = object.value.dict()?;
-    if dict.contains_key(b"DecodeParms".as_slice()) || dict.contains_key(b"F".as_slice()) {
+    if dict.contains_key(b"F".as_slice()) {
         return Err(unsupported(
-            "PDF stream predictors, decode parameters and external data are unsupported",
+            "PDF streams whose bytes live in an external file (/F) are unsupported",
         ));
     }
+    let predictor = decode_parms(dict)?;
     let Some(filter) = dict.get(b"Filter".as_slice()) else {
+        if predictor.is_some() {
+            return Err(bad("PDF stream decode parameters require a filter"));
+        }
         return Ok(raw.to_vec());
     };
     let filter = match filter {
@@ -774,7 +897,10 @@ pub fn decode(object: &Object<'_>) -> Result<Vec<u8>> {
             if decoder.total_in() as usize != raw.len() {
                 return Err(bad("Trailing data after PDF zlib stream"));
             }
-            return Ok(output);
+            return match predictor {
+                Some(predictor) => predictor.apply(output),
+                None => Ok(output),
+            };
         }
         if decoder.total_in() as usize == before_in && written == 0 {
             return Err(bad("Truncated PDF zlib stream"));

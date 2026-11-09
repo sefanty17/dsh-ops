@@ -1,12 +1,11 @@
-//! Cross-reference tables and streams, object streams, indirect integers, offset tolerance and
-//! structural limits.
+//! Cross-reference tables and streams, object streams, incremental updates, indirect integers,
+//! offset tolerance and structural limits.
 mod common;
 
 use common::{
-    CATALOG, HEADER, HELVETICA, PAGE, PAGES, Pdf, classic, object_stream, read, row, stream,
-    stream_with_length, text,
+    CATALOG, HEADER, HELVETICA, PAGE, PAGES, Pdf, classic, object_stream, read, row, stream, stream_with_length, text,
 };
-use ops_documents::pdf_container::{MAX_FILE, MAX_STREAM, parse};
+use ops_documents::pdf_container::{MAX_FILE, MAX_SECTIONS, MAX_STREAM, parse};
 use serde_json::json;
 
 const CONTENT: &[u8] = b"BT /F1 12 Tf (Hello) Tj ET";
@@ -220,6 +219,36 @@ fn xref_stream_shapes_are_used() {
     assert_eq!(document.objects.len(), 6);
     assert_eq!(document.root, (1, 0));
     read_text(&bytes, "Hello");
+
+    let mut narrow = Pdf::new();
+    narrow.object(CATALOG);
+    narrow.object(PAGES);
+    narrow.object(PAGE);
+    let stream_offset = narrow.bytes.len();
+    let mut rows = vec![common::narrow_row(0, 0, 255)];
+    for number in 1..=3 {
+        rows.push(common::narrow_row(1, narrow.offsets[&number] as u32, 0));
+    }
+    rows.push(common::narrow_row(1, stream_offset as u32, 0));
+    narrow.stream(
+        "/Type /XRef /Size 5 /W [1 4 1] /Index [0 5] /Root 1 0 R",
+        &rows.concat(),
+    );
+    narrow
+        .bytes
+        .extend_from_slice(format!("startxref\n{stream_offset}\n%%EOF\n").as_bytes());
+    let document = parse(&narrow.bytes).expect("a one-byte generation field must parse");
+    assert_eq!(document.objects.len(), 4);
+    assert_eq!(document.root, (1, 0));
+
+    let mut predicted = Pdf::new();
+    for body in hello_objects() {
+        predicted.object(&body);
+    }
+    let bytes = predicted.finish_png_xref("");
+    let document = parse(&bytes).expect("a PNG Up xref stream must parse");
+    assert_eq!(document.objects.len(), 6);
+    read_text(&bytes, "Hello");
 }
 
 #[test]
@@ -257,6 +286,158 @@ fn object_streams_expand_and_merge_with_hybrid_tables() {
         7
     );
     assert!(document.object((7, 0)).expect("object 7").value.dict().is_err());
+
+    let mut hybrid = Pdf::new();
+    hybrid.object(CATALOG);
+    hybrid.object(PAGES);
+    hybrid.object(PAGE);
+    let (decoded, first) = object_stream(&[(6, b"<< /Kind /Compressed >>"), (7, b"(text)")]);
+    hybrid.stream(&format!("/Type /ObjStm /N 2 /First {first}"), &decoded);
+    let stream_offset = hybrid.bytes.len();
+    let mut rows = Vec::new();
+    rows.extend_from_slice(&row(2, 4, 0));
+    rows.extend_from_slice(&row(2, 4, 1));
+    hybrid.stream("/Type /XRef /Size 8 /W [1 4 2] /Index [6 2] /Root 1 0 R", &rows);
+    let xref = hybrid.bytes.len();
+    hybrid
+        .bytes
+        .extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+    for number in 1..=5 {
+        let offset = hybrid.offsets[&number];
+        hybrid
+            .bytes
+            .extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    hybrid
+        .bytes
+        .extend_from_slice(b"0000000000 00001 f \n0000000000 00002 f \n");
+    hybrid.bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 8 /Root 1 0 R /XRefStm {stream_offset} >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    let document = parse(&hybrid.bytes).expect("a hybrid-reference file must merge");
+    assert_eq!(document.objects.len(), 7);
+    let compressed = document.object((6, 0)).expect("compressed object 6");
+    assert_eq!(
+        ops_documents::pdf_container::get(compressed.value.dict().expect("dictionary"), b"Kind")
+            .expect("Kind")
+            .name()
+            .expect("name"),
+        b"Compressed"
+    );
+}
+
+#[test]
+fn incremental_revisions_follow_prev() {
+    let mut empty = Pdf::new();
+    for body in [CATALOG, PAGES, PAGE] {
+        empty.object(body);
+    }
+    let previous = empty.classic_section(3, 4, "/Root 1 0 R");
+    empty.empty_revision(4, &format!("/Root 1 0 R /Prev {previous}"));
+    let document = parse(&empty.bytes).expect("an empty incremental subsection is not an error");
+    assert_eq!(document.objects.len(), 3);
+    assert_eq!(document.root, (1, 0));
+
+    let mut superseded = Pdf::new();
+    for body in [CATALOG, PAGES, PAGE] {
+        superseded.object(body);
+    }
+    let previous = superseded.classic_section(3, 4, "/Root 1 0 R");
+    let updated = superseded.bytes.len();
+    superseded.numbered(3, b"<< /Type /Page /Parent 2 0 R /Updated true >>");
+    let added = superseded.bytes.len();
+    superseded.numbered(4, b"<< /Revision 2 >>");
+    let current = superseded.bytes.len();
+    superseded.bytes.extend_from_slice(
+        format!(
+            "xref\r\n3 1\r\n{updated:010} 00000 n\r\n4 1\r\n{added:010} 00000 n\r\ntrailer\r\n\
+             << /Size 5 /Root 1 0 R /Prev {previous} >>\r\nstartxref\r\n{current}\r\n%%EOF\r\n"
+        )
+        .as_bytes(),
+    );
+    let document = parse(&superseded.bytes).expect("incremental revision must merge");
+    assert_eq!(document.objects.len(), 4);
+    let page = document.object((3, 0)).expect("rewritten page").value.dict().expect("page");
+    assert!(page.contains_key(b"Updated".as_slice()));
+    let added = document.object((4, 0)).expect("added object");
+    assert_eq!(
+        ops_documents::pdf_container::get(added.value.dict().expect("dictionary"), b"Revision")
+            .expect("Revision")
+            .integer()
+            .expect("bounded integer"),
+        2
+    );
+
+    let mut stream_prev = Pdf::new();
+    for body in [CATALOG, PAGES, PAGE] {
+        stream_prev.object(body);
+    }
+    let previous = stream_prev.classic_section(3, 4, "/Root 1 0 R");
+    let added = stream_prev.object(b"<< /Revision 2 >>");
+    assert_eq!(added, 4);
+    let offset = stream_prev.offsets[&4] as u32;
+    let stream_offset = stream_prev.bytes.len();
+    stream_prev.stream(
+        &format!("/Type /XRef /Size 6 /W [1 4 2] /Index [4 1] /Root 1 0 R /Prev {previous}"),
+        &row(1, offset, 0),
+    );
+    stream_prev
+        .bytes
+        .extend_from_slice(format!("startxref\n{stream_offset}\n%%EOF\n").as_bytes());
+    let document = parse(&stream_prev.bytes).expect("an xref-stream revision must follow /Prev");
+    assert_eq!(document.objects.len(), 4);
+    assert!(document.object((4, 0)).is_ok());
+}
+
+fn revision_with_prev(prev: impl Fn(usize) -> usize) -> Vec<u8> {
+    let mut pdf = Pdf::new();
+    for body in [CATALOG, PAGES, PAGE] {
+        pdf.object(body);
+    }
+    pdf.classic_section(3, 4, "/Root 1 0 R");
+    let current = pdf.bytes.len();
+    pdf.bytes.extend_from_slice(
+        format!(
+            "xref\n0 0\ntrailer\n<< /Size 4 /Root 1 0 R /Prev {} >>\nstartxref\n{current}\n%%EOF\n",
+            prev(current)
+        )
+        .as_bytes(),
+    );
+    pdf.bytes
+}
+
+fn hybrid_conflict_document() -> Vec<u8> {
+    let mut pdf = Pdf::new();
+    for body in [CATALOG, PAGES, PAGE] {
+        pdf.object(body);
+    }
+    let (decoded, first) = object_stream(&[(6, b"<< /Kind /Compressed >>")]);
+    pdf.stream(&format!("/Type /ObjStm /N 1 /First {first}"), &decoded);
+    let stream_offset = pdf.bytes.len();
+    pdf.stream(
+        "/Type /XRef /Size 7 /W [1 4 2] /Index [6 1] /Root 1 0 R",
+        &row(2, 4, 0),
+    );
+    let xref = pdf.bytes.len();
+    pdf.bytes
+        .extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for number in 1..=5 {
+        let offset = pdf.offsets[&number];
+        pdf.bytes
+            .extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.bytes.extend_from_slice(
+        format!(
+            "6 1\n{:010} 00000 n \ntrailer\n<< /Size 7 /Root 1 0 R /XRefStm {stream_offset} >>\n\
+             startxref\n{xref}\n%%EOF\n",
+            pdf.offsets[&4]
+        )
+        .as_bytes(),
+    );
+    pdf.bytes
 }
 
 #[test]
@@ -277,11 +458,24 @@ fn malformed_xref_sections_are_refused() {
         "/Type /XRef /Size 4 /W [1 4 2] /Index [0 1 2] /Root 1 0 R",
         &[row(0, 0, 0)],
     );
+    let mut hop_chain = Pdf::new();
+    for body in [CATALOG, PAGES, PAGE] {
+        hop_chain.object(body);
+    }
+    let mut previous = hop_chain.classic_section(3, 4, "/Root 1 0 R");
+    for _ in 0..MAX_SECTIONS {
+        previous = hop_chain.empty_revision(4, &format!("/Root 1 0 R /Prev {previous}"));
+    }
+    let _ = previous;
     for (case, bytes, code, needle) in [
         ("an entry type 3", type_three, "UNSUPPORTED_DOCUMENT", "0, 1 and 2"),
         ("a short payload", short_payload, "DOCUMENT_PARSE_ERROR", "Index"),
         ("a five-byte field", wide_field, "OUTPUT_LIMIT", "field exceeds 4 bytes"),
         ("an odd Index", odd_index, "DOCUMENT_PARSE_ERROR", "offset/count pairs"),
+        ("a conflicting hybrid entry", hybrid_conflict_document(), "DOCUMENT_PARSE_ERROR", "hybrid"),
+        ("a forward /Prev", revision_with_prev(|current| current + 10), "DOCUMENT_PARSE_ERROR", "earlier"),
+        ("a self-referencing /Prev", revision_with_prev(|current| current), "DOCUMENT_PARSE_ERROR", "Cyclic"),
+        ("a chain past 64 hops", hop_chain.bytes, "OUTPUT_LIMIT", "64"),
     ] {
         let error = parse(&bytes).err().unwrap_or_else(|| panic!("{case} must fail"));
         assert_eq!(error.code, code, "{case}: {}", error.message);
