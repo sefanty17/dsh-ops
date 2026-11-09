@@ -168,6 +168,13 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   instead of failing with "Expected a bounded nonnegative PDF integer" (#646).
 - 读取流 `/Length`、trailer `/Size` 或页面树 `/Count` 为间接引用的 PDF：经 xref 表解析引用链，
   带跳数上限与环检测，不再以 "Expected a bounded nonnegative PDF integer" 失败（#646）。
+- Read PDFs whose text layer uses an embedded or CID font: Type0/Identity-H/V fonts and simple
+  fonts carrying a `ToUnicode` CMap now map character codes to Unicode, where only standard
+  Type1 encodings were decoded before. Glyph programs, `DescendantFonts` and `CIDToGIDMap`
+  are never read (#646).
+- 读取文本层使用嵌入字体或 CID 字体的 PDF：Type0/Identity-H/V 字体与带 `ToUnicode` CMap 的简单
+  字体现在能把字符码映射为 Unicode，此前只解码标准 Type1 编码；字形程序、`DescendantFonts` 与
+  `CIDToGIDMap` 仍不读取（#646）。
 - Read PDFs with modern cross-reference structures: a cross-reference stream (`/Type /XRef` with
   `/W` and `/Index`) and object streams (`/Type /ObjStm`) are decoded into the bounded object
   table, and incremental updates are followed through a `/Prev` chain, including a hybrid
