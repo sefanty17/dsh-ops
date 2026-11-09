@@ -55,15 +55,31 @@ await test('unsupported later operators keep preceding complete pages without in
     }
   })
 })
-await test('unsupported fonts mappings controls and older encoding semantics fail explicitly', async () => {
-  await withTempDir('pdf-fonts', async root => {
-    for (const options of [{ font: 'Symbol' }, { font: 'Arial' }, { encoding: 'MacRomanEncoding' }, { fontExtra: '/ToUnicode 3 0 R' }, { fontExtra: '/FontDescriptor 3 0 R' }, { version: '1.2' }]) {
-      failure(await run(root, { path: fileAt(root, textPdf([show('text')], options)) }), 'UNSUPPORTED_DOCUMENT')
-    }
-    failure(await run(root, { path: fileAt(root, textPdf([show(Buffer.from([0xe9]))], { encoding: null })) }), 'UNSUPPORTED_DOCUMENT')
-    failure(await run(root, { path: fileAt(root, textPdf([show(Buffer.from([0,10]))])) }), 'UNSUPPORTED_DOCUMENT')
+    const value = Buffer.alloc(30000, 0xe9), expected = 'é'.repeat(30000)
+    const file = fileAt(root, textPdf([show(value), show('last')], { deflate: true }))
+    const head = await run(root, { path: file }, { cache, maxBytes: 4096 })
+    assert.ok(head.reference, JSON.stringify(head)); assert.equal(head.complete, false); assert.equal(head.nextOffset, 1)
+    assert.equal(head.referenceRoot, process.platform === 'win32' ? path.toNamespacedPath(fs.realpathSync.native(root)) : fs.realpathSync(root))
+    const records = []; let offset = 0, source
+    for (;;) { const next = await run(head.referenceRoot, { action: 'page', id: head.reference.refId, offset, limit: 512, maxBytes: 65536 }, { cache, tool: 'result', readOnly: true }); assert.equal(next.error, undefined); records.push(...next.items); source = next.source; assert.ok(next.nextOffset > offset); offset = next.nextOffset; if (next.complete) break }
+    assert.equal(source.scope, 'page-text-layer-content-order'); assert.equal(source.scanComplete, true); assert.equal(source.captureComplete, true); assert.equal(source.total, 2)
+    const rows = []; let chunks = [], byteOffset = 0
+    for (const item of records) { assert.equal(item.index, rows.length); if (item.kind === 'item') { rows.push(item.value); continue } assert.equal(item.chunk, chunks.length); assert.equal(item.byteOffset, byteOffset); chunks.push(item.text); byteOffset += Buffer.byteLength(item.text); if (item.complete) { rows.push(JSON.parse(chunks.join(''))); chunks = []; byteOffset = 0 } }
+    assert.deepEqual(rows.map(row => row.text), [expected, 'last']); assert.equal(chunks.length, 0); assert.deepEqual(rows[0].runs, [expected])
+    const readonly = await run(root, { path: file }, { cache, readOnly: true, maxBytes: 4096 }); assert.equal(readonly.reference, undefined); assert.equal(readonly.storageError.code, 'POLICY_DENIED'); assert.equal(readonly.complete, false)
   })
 })
+await test('transport output limit still reports no business effects in writable sessions', async () => {
+  await withTempDir('pdf-transport', async root => { failure(await run(root, { path: fileAt(root, textPdf([show('x'.repeat(30000))])) }, { maxBytes: 1024 }), 'OUTPUT_LIMIT') })
+})
+await test('out-of-range offsets count actual skips and sparse blank pages remain empty', async () => {
+  await withTempDir('pdf-sparse', async root => {
+    const file=fileAt(root,textPdf([show('one'),show('two')]))
+    const beyond=await run(root,{path:file,offset:32,limit:1})
+    assert.equal(beyond.skipped,2);assert.equal(beyond.total,2);assert.deepEqual(beyond.items,[]);assert.equal(beyond.complete,true)
+    const blanks=[catalog,'<< /Type /Pages /Kids [4 0 R 5 0 R 6 0 R] /Count 3 >>',font,
+      '<< /Type /Page /Parent 2 0 R >>',page('null'),page('7 0 R'),stream('% comment only\n')]
+    const body=await run(root,{path:fileAt(root,pdf(blanks))})
 await test('malformed content cannot be accepted as complete text', async () => {
   await withTempDir('pdf-grammar', async root => {
     for (const content of ['BT BT ET ET', '(x) Tj', 'ET', 'BT /F1 Tf ET', 'BT /F1 12 Tf [(x) /bad] TJ ET', 'BT /F1 12 Tf (x) Tj', 'q', 'Q', '1 2', 'BT /F1 12 Tf 8 Tr (x) Tj ET', 'BT /F1 12 Tf <xy> Tj ET']) {
