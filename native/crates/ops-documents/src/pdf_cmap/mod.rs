@@ -1,11 +1,15 @@
+//! The next slice wires this module into font decoding; until then nothing
+//! constructs it.
+#![allow(dead_code)]
+
 //! Bounded ToUnicode CMap decoding: character codes to Unicode. Glyph programs are never read.
 mod parse;
 mod ranges;
-mod utf16;
 #[cfg(test)]
 mod tests;
-pub use utf16::code;
+mod utf16;
 use std::collections::BTreeMap;
+pub use utf16::code;
 /// Mappings accepted from one CMap.
 pub const MAX_ENTRIES: usize = 65_536;
 /// Codespace segments accepted from one CMap.
