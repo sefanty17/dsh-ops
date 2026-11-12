@@ -308,12 +308,7 @@ fn read_section(data: &[u8], offset: usize, last: bool, footer_start: usize) -> 
         stream_section(data, offset, last, footer_start)
     }
 }
-fn classic_section(
-    data: &[u8],
-    offset: usize,
-    last: bool,
-    footer_start: usize,
-) -> Result<Section> {
+fn classic_section(data: &[u8], offset: usize, last: bool, footer_start: usize) -> Result<Section> {
     let mut lexer = Lexer {
         data,
         at: offset,
@@ -594,7 +589,10 @@ impl<'a> Loader<'a> {
             .get(&(stream as usize))
             .ok_or_else(|| bad("PDF object stream does not name an active xref entry"))?
         {
-            XrefEntry::Offset { offset, generation: 0 } => offset,
+            XrefEntry::Offset {
+                offset,
+                generation: 0,
+            } => offset,
             _ => {
                 return Err(bad(
                     "PDF object stream must be an uncompressed generation-zero object",
@@ -631,11 +629,7 @@ impl<'a> Loader<'a> {
 }
 /// Reject ranges that overlap: an xref offset is an object header, never a byte inside one.
 /// Bytes before the first indexed construct are only the version line and at most one comment.
-fn verify_ranges(
-    data: &[u8],
-    mut ranges: Vec<(usize, usize)>,
-    footer_start: usize,
-) -> Result<()> {
+fn verify_ranges(data: &[u8], mut ranges: Vec<(usize, usize)>, footer_start: usize) -> Result<()> {
     ranges.sort_unstable();
     if let Some((first, _)) = ranges.first() {
         let mut gap = Lexer::new(data);
@@ -773,9 +767,7 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         return Err(limit("PDF Size exceeds 10000 objects"));
     }
     if loader.entries.keys().any(|number| *number >= size) {
-        return Err(bad(
-            "PDF xref declares an object number at or above Size",
-        ));
+        return Err(bad("PDF xref declares an object number at or above Size"));
     }
     // A classic table declares every number below Size; a stream may leave holes until referenced.
     if !sparse && loader.entries.len() != size {
@@ -790,7 +782,11 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         if !matches!(zero, Some(XrefEntry::Free { .. })) {
             return Err(bad("PDF object zero must be a free entry"));
         }
-    } else if zero != Some(XrefEntry::Free { generation: u16::MAX }) {
+    } else if zero
+        != Some(XrefEntry::Free {
+            generation: u16::MAX,
+        })
+    {
         return Err(bad("PDF object zero must be free with generation 65535"));
     }
     let pending: Vec<(usize, XrefEntry)> = loader
@@ -804,7 +800,9 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
             XrefEntry::Free { .. } => {}
             XrefEntry::Offset { offset, generation } => {
                 if *offset < 9 || *offset >= footer_start {
-                    return Err(bad("Active PDF object offset is outside the object section"));
+                    return Err(bad(
+                        "Active PDF object offset is outside the object section",
+                    ));
                 }
                 loader.object_at((*number as u32, *generation), *offset)?;
             }

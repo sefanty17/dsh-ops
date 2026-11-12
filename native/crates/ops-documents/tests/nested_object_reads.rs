@@ -31,5 +31,9 @@ fn length_chain(links: usize) -> Vec<u8> {
 fn indirect_length_chain_past_the_read_bound_is_refused() {
     let error = parse(&length_chain(100)).expect_err("lengths that name each other must fail");
     assert_eq!(error.code, "OUTPUT_LIMIT", "{}", error.message);
-    assert!(error.message.contains("nest more than 64"), "{}", error.message);
+    assert!(
+        error.message.contains("nest more than 64"),
+        "{}",
+        error.message
+    );
 }

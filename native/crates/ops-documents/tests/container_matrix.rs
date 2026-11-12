@@ -3,7 +3,8 @@
 mod common;
 
 use common::{
-    CATALOG, HEADER, HELVETICA, PAGE, PAGES, Pdf, classic, object_stream, read, row, stream, stream_with_length, text,
+    CATALOG, HEADER, HELVETICA, PAGE, PAGES, Pdf, classic, object_stream, read, row, stream,
+    stream_with_length, text,
 };
 use ops_documents::pdf_container::{MAX_FILE, MAX_SECTIONS, MAX_STREAM, parse};
 use serde_json::json;
@@ -48,7 +49,8 @@ fn xref_stream_document(dict: &str, rows: &[[u8; 7]]) -> Vec<u8> {
     pdf.object(PAGE);
     let offset = pdf.bytes.len();
     pdf.stream(dict, &rows.concat());
-    pdf.bytes.extend_from_slice(format!("startxref\n{offset}\n%%EOF\n").as_bytes());
+    pdf.bytes
+        .extend_from_slice(format!("startxref\n{offset}\n%%EOF\n").as_bytes());
     pdf.bytes
 }
 
@@ -95,7 +97,10 @@ fn indirect_integers_resolve_in_every_direction() {
         assert_eq!(document.objects.len(), size - 1, "{case}");
         let content = if case == "backward" { 5 } else { 4 };
         assert_eq!(
-            document.object((content, 0)).expect("content object").stream,
+            document
+                .object((content, 0))
+                .expect("content object")
+                .stream,
             Some(CONTENT),
             "{case}"
         );
@@ -109,24 +114,36 @@ fn indirect_integers_resolve_in_every_direction() {
     size.object(b"7");
     let objects = size.offsets.len();
     let xref = size.bytes.len();
-    size.bytes
-        .extend_from_slice(format!("xref
+    size.bytes.extend_from_slice(
+        format!(
+            "xref
 0 {}
 0000000000 65535 f 
-", objects + 1).as_bytes());
+",
+            objects + 1
+        )
+        .as_bytes(),
+    );
     for number in 1..=objects {
         let offset = size.offsets[&number];
-        size.bytes
-            .extend_from_slice(format!("{offset:010} 00000 n 
-").as_bytes());
+        size.bytes.extend_from_slice(
+            format!(
+                "{offset:010} 00000 n 
+"
+            )
+            .as_bytes(),
+        );
     }
     size.bytes.extend_from_slice(
-        format!("trailer
+        format!(
+            "trailer
 << /Size 6 0 R /Root 1 0 R >>
 startxref
 {xref}
 %%EOF
-").as_bytes(),
+"
+        )
+        .as_bytes(),
     );
     read_text(&size.bytes, "Hello");
 }
@@ -152,24 +169,36 @@ fn dangling_and_cyclic_indirect_integers_are_reference_errors() {
     }
     let objects = size.offsets.len();
     let xref = size.bytes.len();
-    size.bytes
-        .extend_from_slice(format!("xref
+    size.bytes.extend_from_slice(
+        format!(
+            "xref
 0 {}
 0000000000 65535 f 
-", objects + 1).as_bytes());
+",
+            objects + 1
+        )
+        .as_bytes(),
+    );
     for number in 1..=objects {
         let offset = size.offsets[&number];
-        size.bytes
-            .extend_from_slice(format!("{offset:010} 00000 n 
-").as_bytes());
+        size.bytes.extend_from_slice(
+            format!(
+                "{offset:010} 00000 n 
+"
+            )
+            .as_bytes(),
+        );
     }
     size.bytes.extend_from_slice(
-        format!("trailer
+        format!(
+            "trailer
 << /Size 9 0 R /Root 1 0 R >>
 startxref
 {xref}
 %%EOF
-").as_bytes(),
+"
+        )
+        .as_bytes(),
     );
 
     let chain = |five: &[u8]| {
@@ -206,9 +235,17 @@ startxref
         ),
     ] {
         let error = read(&bytes, json!({})).expect_err("the reference must fail the read");
-        assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{case}: {}", error.message);
+        assert_eq!(
+            error.code, "DOCUMENT_PARSE_ERROR",
+            "{case}: {}",
+            error.message
+        );
         assert!(error.message.contains(needle), "{case}: {}", error.message);
-        assert!(!error.message.contains("bounded nonnegative"), "{case}: {}", error.message);
+        assert!(
+            !error.message.contains("bounded nonnegative"),
+            "{case}: {}",
+            error.message
+        );
     }
 }
 
@@ -285,7 +322,14 @@ fn object_streams_expand_and_merge_with_hybrid_tables() {
             .expect("bounded integer"),
         7
     );
-    assert!(document.object((7, 0)).expect("object 7").value.dict().is_err());
+    assert!(
+        document
+            .object((7, 0))
+            .expect("object 7")
+            .value
+            .dict()
+            .is_err()
+    );
 
     let mut hybrid = Pdf::new();
     hybrid.object(CATALOG);
@@ -297,7 +341,10 @@ fn object_streams_expand_and_merge_with_hybrid_tables() {
     let mut rows = Vec::new();
     rows.extend_from_slice(&row(2, 4, 0));
     rows.extend_from_slice(&row(2, 4, 1));
-    hybrid.stream("/Type /XRef /Size 8 /W [1 4 2] /Index [6 2] /Root 1 0 R", &rows);
+    hybrid.stream(
+        "/Type /XRef /Size 8 /W [1 4 2] /Index [6 2] /Root 1 0 R",
+        &rows,
+    );
     let xref = hybrid.bytes.len();
     hybrid
         .bytes
@@ -360,7 +407,12 @@ fn incremental_revisions_follow_prev() {
     );
     let document = parse(&superseded.bytes).expect("incremental revision must merge");
     assert_eq!(document.objects.len(), 4);
-    let page = document.object((3, 0)).expect("rewritten page").value.dict().expect("page");
+    let page = document
+        .object((3, 0))
+        .expect("rewritten page")
+        .value
+        .dict()
+        .expect("page");
     assert!(page.contains_key(b"Updated".as_slice()));
     let added = document.object((4, 0)).expect("added object");
     assert_eq!(
@@ -468,16 +520,58 @@ fn malformed_xref_sections_are_refused() {
     }
     let _ = previous;
     for (case, bytes, code, needle) in [
-        ("an entry type 3", type_three, "UNSUPPORTED_DOCUMENT", "0, 1 and 2"),
-        ("a short payload", short_payload, "DOCUMENT_PARSE_ERROR", "Index"),
-        ("a five-byte field", wide_field, "OUTPUT_LIMIT", "field exceeds 4 bytes"),
-        ("an odd Index", odd_index, "DOCUMENT_PARSE_ERROR", "offset/count pairs"),
-        ("a conflicting hybrid entry", hybrid_conflict_document(), "DOCUMENT_PARSE_ERROR", "hybrid"),
-        ("a forward /Prev", revision_with_prev(|current| current + 10), "DOCUMENT_PARSE_ERROR", "earlier"),
-        ("a self-referencing /Prev", revision_with_prev(|current| current), "DOCUMENT_PARSE_ERROR", "Cyclic"),
-        ("a chain past 64 hops", hop_chain.bytes, "OUTPUT_LIMIT", "64"),
+        (
+            "an entry type 3",
+            type_three,
+            "UNSUPPORTED_DOCUMENT",
+            "0, 1 and 2",
+        ),
+        (
+            "a short payload",
+            short_payload,
+            "DOCUMENT_PARSE_ERROR",
+            "Index",
+        ),
+        (
+            "a five-byte field",
+            wide_field,
+            "OUTPUT_LIMIT",
+            "field exceeds 4 bytes",
+        ),
+        (
+            "an odd Index",
+            odd_index,
+            "DOCUMENT_PARSE_ERROR",
+            "offset/count pairs",
+        ),
+        (
+            "a conflicting hybrid entry",
+            hybrid_conflict_document(),
+            "DOCUMENT_PARSE_ERROR",
+            "hybrid",
+        ),
+        (
+            "a forward /Prev",
+            revision_with_prev(|current| current + 10),
+            "DOCUMENT_PARSE_ERROR",
+            "earlier",
+        ),
+        (
+            "a self-referencing /Prev",
+            revision_with_prev(|current| current),
+            "DOCUMENT_PARSE_ERROR",
+            "Cyclic",
+        ),
+        (
+            "a chain past 64 hops",
+            hop_chain.bytes,
+            "OUTPUT_LIMIT",
+            "64",
+        ),
     ] {
-        let error = parse(&bytes).err().unwrap_or_else(|| panic!("{case} must fail"));
+        let error = parse(&bytes)
+            .err()
+            .unwrap_or_else(|| panic!("{case} must fail"));
         assert_eq!(error.code, code, "{case}: {}", error.message);
         assert!(error.message.contains(needle), "{case}: {}", error.message);
     }
@@ -486,8 +580,10 @@ fn malformed_xref_sections_are_refused() {
 fn one_object(body: &[u8], declared: usize) -> Vec<u8> {
     let mut pdf = HEADER.to_vec();
     pdf.extend_from_slice(body);
-    pdf.extend_from_slice(b"
-");
+    pdf.extend_from_slice(
+        b"
+",
+    );
     let xref = pdf.len();
     pdf.extend_from_slice(
         format!(
@@ -504,9 +600,19 @@ fn offset_tolerance_is_bounded_and_comments_are_not_headers() {
     let object = b"1 0 obj\n<<>>\nendobj";
     let accepted = [vec![b' '; 32], object.to_vec()].concat();
     let pdf = one_object(&accepted, 15);
-    assert_eq!(parse(&pdf).expect("a 32-byte lead is tolerated").objects.len(), 1);
+    assert_eq!(
+        parse(&pdf)
+            .expect("a 32-byte lead is tolerated")
+            .objects
+            .len(),
+        1
+    );
     let rejected = [vec![b' '; 33], object.to_vec()].concat();
-    parse_error(&one_object(&rejected, 15), "DOCUMENT_PARSE_ERROR", "must point exactly");
+    parse_error(
+        &one_object(&rejected, 15),
+        "DOCUMENT_PARSE_ERROR",
+        "must point exactly",
+    );
 
     for (body, header) in [
         (b"%   1 0 obj\n1 0 obj\n<<>>\nendobj\n".as_slice(), 4),
@@ -521,7 +627,10 @@ fn offset_tolerance_is_bounded_and_comments_are_not_headers() {
     }
 
     let mut two = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj (100%) 2 0 obj\n<<>>\nendobj\n".to_vec();
-    let second = two.windows(7).position(|window| window == b"2 0 obj").expect("header");
+    let second = two
+        .windows(7)
+        .position(|window| window == b"2 0 obj")
+        .expect("header");
     let xref = two.len();
     two.extend_from_slice(
         format!(
@@ -531,10 +640,24 @@ fn offset_tolerance_is_bounded_and_comments_are_not_headers() {
         )
         .as_bytes(),
     );
-    assert_eq!(parse(&two).expect("the header follows a string").objects.len(), 2);
+    assert_eq!(
+        parse(&two)
+            .expect("the header follows a string")
+            .objects
+            .len(),
+        2
+    );
 
-    parse_error(&one_object(b"X1 0 obj\n<<>>\nendobj\n", 15), "DOCUMENT_PARSE_ERROR", "must point exactly");
-    parse_error(&one_object(b"X1 0 obj\n<<>>\nendobj\n", 16), "DOCUMENT_PARSE_ERROR", "must follow whitespace");
+    parse_error(
+        &one_object(b"X1 0 obj\n<<>>\nendobj\n", 15),
+        "DOCUMENT_PARSE_ERROR",
+        "must point exactly",
+    );
+    parse_error(
+        &one_object(b"X1 0 obj\n<<>>\nendobj\n", 16),
+        "DOCUMENT_PARSE_ERROR",
+        "must follow whitespace",
+    );
 }
 
 #[test]
@@ -563,7 +686,10 @@ fn truncated_and_mutated_documents_never_panic() {
         }
     }
     let mut corrupt = pdf.clone();
-    let end = corrupt.windows(10).rposition(|window| window == b"\nendstream").expect("endstream");
+    let end = corrupt
+        .windows(10)
+        .rposition(|window| window == b"\nendstream")
+        .expect("endstream");
     corrupt[end - 1] ^= 1;
     parse_error(&corrupt, "DOCUMENT_PARSE_ERROR", "");
 }
@@ -573,14 +699,21 @@ fn input_and_structure_limits_are_refused_at_one_over() {
     let oversized = vec![b' '; MAX_FILE + 1];
     let error = read(&oversized, json!({})).expect_err("a file over 16 MiB must fail");
     assert_eq!(error.code, "OUTPUT_LIMIT");
-    assert!(error.next_action.contains("16 MiB"), "{}", error.next_action);
+    assert!(
+        error.next_action.contains("16 MiB"),
+        "{}",
+        error.next_action
+    );
 
-    let bodies: Vec<Vec<u8>> = vec![
-        format!("<< /Length {} >>\nstream\nx\nendstream", MAX_STREAM + 1).into_bytes(),
-    ];
+    let bodies: Vec<Vec<u8>> =
+        vec![format!("<< /Length {} >>\nstream\nx\nendstream", MAX_STREAM + 1).into_bytes()];
     for (index, body) in bodies.iter().enumerate() {
         let error = parse(&classic(std::slice::from_ref(body)))
             .expect_err(&format!("limit fixture {index} must be refused"));
-        assert_eq!(error.code, "OUTPUT_LIMIT", "fixture {index}: {}", error.message);
+        assert_eq!(
+            error.code, "OUTPUT_LIMIT",
+            "fixture {index}: {}",
+            error.message
+        );
     }
 }
