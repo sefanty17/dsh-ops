@@ -68,16 +68,18 @@ pub fn read(request: &Request) -> Result<Value> {
     let (mut observed, mut selected, mut inline_bytes) = (0usize, 0usize, 0usize);
     let (mut items, mut failure, mut cut) = (Vec::new(), None, false);
     for (index, page) in pages.iter().enumerate() {
-        let result = streams.content(&document, page, started).and_then(|content| {
-            pdf_text::extract(
-                &document,
-                page.resources,
-                &content,
-                started,
-                &mut fonts,
-                &mut streams.decoded,
-            )
-        });
+        let result = streams
+            .content(&document, page, started)
+            .and_then(|content| {
+                pdf_text::extract(
+                    &document,
+                    page.resources,
+                    &content,
+                    started,
+                    &mut fonts,
+                    &mut streams.decoded,
+                )
+            });
         let runs = match result {
             Ok(runs) => runs,
             Err(error) => {

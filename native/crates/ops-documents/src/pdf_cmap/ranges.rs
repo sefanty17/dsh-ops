@@ -1,7 +1,5 @@
 //! The collected mapping table, validated against the codespace once the stream ends.
-use super::{
-    CMap, ENTRY_BYTES, MAX_BYTES, MAX_ENTRIES, MAX_RANGES, MAX_WIDTH, code, utf16::utf16,
-};
+use super::{CMap, ENTRY_BYTES, MAX_BYTES, MAX_ENTRIES, MAX_RANGES, MAX_WIDTH, code, utf16::utf16};
 use crate::pdf_syntax::{Value, bad, limit, unsupported};
 use ops_protocol::Result;
 use std::collections::BTreeMap;

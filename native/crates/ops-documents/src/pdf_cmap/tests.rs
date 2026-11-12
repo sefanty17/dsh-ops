@@ -28,7 +28,9 @@ fn cmap_mappings_cover_bfchar_bfrange_arrays_and_surrogates() {
     assert_eq!(table.target(0x0005), Some("ff"));
     assert_eq!(table.target(0x0006), Some("\0"));
     assert_eq!(
-        (0x10..=0x12).map(|code| table.target(code)).collect::<Vec<_>>(),
+        (0x10..=0x12)
+            .map(|code| table.target(code))
+            .collect::<Vec<_>>(),
         [Some("A"), Some("B"), Some("C")]
     );
     assert_eq!(table.target(0x20), Some("中"));

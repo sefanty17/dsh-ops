@@ -62,5 +62,4 @@ fn font_decoders_report_kind_width_and_charged_bytes() {
     assert_eq!(decoder.code_width(), 2);
     assert_eq!(decoder.decoded_bytes(), table.len());
     assert_eq!(decoder.decode(&[0x00, 0x01]).expect("mapped code"), "A");
-
 }

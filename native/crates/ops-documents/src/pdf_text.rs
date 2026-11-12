@@ -6,11 +6,7 @@ use crate::{
     pdf_syntax::{Lexer, Value, bad, limit, unsupported},
 };
 use ops_protocol::Result;
-use std::{
-    collections::BTreeMap,
-    rc::Rc,
-    time::Instant,
-};
+use std::{collections::BTreeMap, rc::Rc, time::Instant};
 /// Fonts whose character-code tables one document may decode.
 pub const MAX_FONTS: usize = 64;
 /// The decoders one page has built, keyed by the /Font resource name its Tf selected; an inline
@@ -212,7 +208,8 @@ pub fn extract(
                 if !inside {
                     return Err(bad("PDF text show outside text object"));
                 }
-                let decoder = selected_decoder(doc, fonts, &mut page_fonts, decoded, &mut selected)?;
+                let decoder =
+                    selected_decoder(doc, fonts, &mut page_fonts, decoded, &mut selected)?;
                 shown = Some(match op {
                     b"TJ" => {
                         if args.len() != 1 {

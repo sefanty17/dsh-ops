@@ -85,11 +85,18 @@ fn builtin(font: &Dict) -> Result<Codes> {
         ));
     }
     match get(font, b"BaseFont")?.name()? {
-        b"Helvetica" | b"Helvetica-Bold" | b"Helvetica-Oblique" | b"Helvetica-BoldOblique"
-        | b"Courier" | b"Courier-Bold" | b"Courier-Oblique" | b"Courier-BoldOblique"
-        | b"Times-Roman" | b"Times-Bold" | b"Times-Italic" | b"Times-BoldItalic" => {
-            Ok(Codes::Standard)
-        }
+        b"Helvetica"
+        | b"Helvetica-Bold"
+        | b"Helvetica-Oblique"
+        | b"Helvetica-BoldOblique"
+        | b"Courier"
+        | b"Courier-Bold"
+        | b"Courier-Oblique"
+        | b"Courier-BoldOblique"
+        | b"Times-Roman"
+        | b"Times-Bold"
+        | b"Times-Italic"
+        | b"Times-BoldItalic" => Ok(Codes::Standard),
         _ => Err(unsupported(
             "PDF font is outside the standard Helvetica/Courier/Times families",
         )),

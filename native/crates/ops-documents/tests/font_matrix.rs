@@ -47,7 +47,10 @@ fn font_failure(font: &str, extras: &[Vec<u8>], code: &str) -> String {
     let output = shown(font, extras, b"BT /F1 12 Tf (A) Tj ET");
     assert_eq!(output["status"], "partial", "{output}");
     assert_eq!(output["error"]["code"], code, "{output}");
-    output["error"]["message"].as_str().expect("failure message").to_owned()
+    output["error"]["message"]
+        .as_str()
+        .expect("failure message")
+        .to_owned()
 }
 
 #[test]
@@ -69,7 +72,10 @@ fn identity_font_maps_bfchar_bfrange_and_surrogates() {
 #[test]
 fn simple_truetype_font_maps_one_byte_codes() {
     let table = one_byte_unicode("2 beginbfchar\n<01> <0051>\n<02> <0033>\nendbfchar");
-    assert_eq!(font_text(SIMPLE, &[table], b"BT /F1 12 Tf <0102> Tj ET"), "Q3");
+    assert_eq!(
+        font_text(SIMPLE, &[table], b"BT /F1 12 Tf <0102> Tj ET"),
+        "Q3"
+    );
 }
 
 #[test]
@@ -141,7 +147,9 @@ fn unsupported_fonts_and_mappings_are_refused() {
 
 #[test]
 fn cmap_budgets_reject_one_over_each_bound() {
-    let declared = raw_cmap("1 begincodespacerange\n<00> <FF>\nendcodespacerange\n65537 beginbfchar\nendbfchar");
+    let declared = raw_cmap(
+        "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n65537 beginbfchar\nendbfchar",
+    );
     let long_target = raw_cmap(&format!(
         "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n1 beginbfchar\n<01> <{}>\nendbfchar",
         "41".repeat(1026)
@@ -152,9 +160,27 @@ fn cmap_budgets_reject_one_over_each_bound() {
     ));
     let mixed = raw_cmap("2 begincodespacerange\n<00> <FF>\n<0000> <FFFF>\nendcodespacerange");
     for (case, table, font, code, needle) in [
-        ("65537 declared mappings", declared, SIMPLE, "OUTPUT_LIMIT", "65536"),
-        ("513-byte destination", long_target, SIMPLE, "OUTPUT_LIMIT", "512 bytes"),
-        ("65 codespace ranges", ranges, IDENTITY, "OUTPUT_LIMIT", "64"),
+        (
+            "65537 declared mappings",
+            declared,
+            SIMPLE,
+            "OUTPUT_LIMIT",
+            "65536",
+        ),
+        (
+            "513-byte destination",
+            long_target,
+            SIMPLE,
+            "OUTPUT_LIMIT",
+            "512 bytes",
+        ),
+        (
+            "65 codespace ranges",
+            ranges,
+            IDENTITY,
+            "OUTPUT_LIMIT",
+            "64",
+        ),
         (
             "mixed code widths",
             mixed,
