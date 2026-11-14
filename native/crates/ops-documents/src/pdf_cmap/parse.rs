@@ -121,10 +121,14 @@ impl CMap {
             args.clear();
         }
         if !matches!(block, Block::None) {
-            return Err(bad("PDF ToUnicode CMap ends inside a block without its end operator"));
+            return Err(bad(
+                "PDF ToUnicode CMap ends inside a block without its end operator",
+            ));
         }
         if !opened {
-            return Err(bad("PDF ToUnicode stream is not a CMap: it has no begincmap"));
+            return Err(bad(
+                "PDF ToUnicode stream is not a CMap: it has no begincmap",
+            ));
         }
         if !closed {
             return Err(bad("PDF ToUnicode CMap is missing endcmap"));

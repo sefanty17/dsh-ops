@@ -265,6 +265,8 @@ struct Section {
     decoded: usize,
     /// Byte just after the section's trailer, or after its %%EOF when another section follows.
     end: usize,
+    /// Values the section and trailer consumed; the file-wide budget starts here.
+    nodes: usize,
 }
 /// A trailer integer that names another section, as a direct bounded offset.
 fn optional_offset(dict: &Dict, key: &[u8]) -> Result<Option<usize>> {
@@ -295,7 +297,14 @@ fn merge_hybrid(
     }
     Ok(())
 }
-fn read_section(data: &[u8], offset: usize, last: bool, footer_start: usize) -> Result<Section> {
+fn read_section(
+    data: &[u8],
+    offset: usize,
+    last: bool,
+    footer_start: usize,
+    started: Instant,
+) -> Result<Section> {
+    check_deadline(started)?;
     if offset < 9 || offset >= footer_start {
         return Err(bad("PDF xref offset points outside the object section"));
     }
@@ -303,9 +312,9 @@ fn read_section(data: &[u8], offset: usize, last: bool, footer_start: usize) -> 
         return Err(bad("PDF xref section must follow whitespace"));
     }
     if data[offset..].starts_with(b"xref") {
-        classic_section(data, offset, last, footer_start)
+        classic_section(data, offset, last, footer_start, started)
     } else {
-        stream_section(data, offset, last, footer_start)
+        stream_section(data, offset, last, footer_start, started)
     }
 }
 fn classic_section(
@@ -313,6 +322,7 @@ fn classic_section(
     offset: usize,
     last: bool,
     footer_start: usize,
+    started: Instant,
 ) -> Result<Section> {
     let mut lexer = Lexer {
         data,
@@ -322,6 +332,7 @@ fn classic_section(
     lexer.keyword(b"xref")?;
     let mut entries: BTreeMap<usize, XrefEntry> = BTreeMap::new();
     loop {
+        check_deadline(started)?;
         lexer.skip();
         if data[lexer.at..].starts_with(b"trailer") {
             lexer.keyword(b"trailer")?;
@@ -379,9 +390,17 @@ fn classic_section(
         stream: false,
         decoded: 0,
         end,
+        nodes: lexer.nodes,
     })
 }
-fn stream_section(data: &[u8], offset: usize, last: bool, footer_start: usize) -> Result<Section> {
+fn stream_section(
+    data: &[u8],
+    offset: usize,
+    last: bool,
+    footer_start: usize,
+    started: Instant,
+) -> Result<Section> {
+    check_deadline(started)?;
     let XrefStream {
         entries,
         trailer,
@@ -406,6 +425,7 @@ fn stream_section(data: &[u8], offset: usize, last: bool, footer_start: usize) -
         stream: true,
         decoded,
         end,
+        nodes: lexer.nodes,
     })
 }
 /// Verify the section's startxref and %%EOF, and return where its bytes end.
@@ -561,6 +581,27 @@ impl<'a> Loader<'a> {
         );
         Ok(())
     }
+    /// Read an object only to cover its bytes: older revisions that a newer xref superseded are
+    /// still indexed by their own section, so the gap verifier must not call them unindexed data.
+    fn record_at(&mut self, id: ObjectId, offset: usize) -> Result<()> {
+        check_deadline(self.started)?;
+        if self.resolving.len() >= MAX_NESTED_OBJECT_READS {
+            return Err(limit("PDF object reads nest more than 64 deep"));
+        }
+        if !self.resolving.insert(id) {
+            return Err(bad("PDF streams cannot resolve each other's length"));
+        }
+        let data = self.data;
+        let raw = {
+            let mut length = |value: &Value| self.length_of(value);
+            read_object(data, offset, Some(id), &mut length)
+        };
+        let raw = raw?;
+        self.resolving.remove(&id);
+        self.charge(raw.nodes)?;
+        self.ranges.push((raw.start, raw.end));
+        Ok(())
+    }
     /// Expand one /Type /ObjStm stream into its inner objects, in stream order; /N and /First may
     /// name another object stream, so in-progress streams are recorded before their values resolve.
     fn expand(&mut self, stream: u32) -> Result<()> {
@@ -594,7 +635,10 @@ impl<'a> Loader<'a> {
             .get(&(stream as usize))
             .ok_or_else(|| bad("PDF object stream does not name an active xref entry"))?
         {
-            XrefEntry::Offset { offset, generation: 0 } => offset,
+            XrefEntry::Offset {
+                offset,
+                generation: 0,
+            } => offset,
             _ => {
                 return Err(bad(
                     "PDF object stream must be an uncompressed generation-zero object",
@@ -629,21 +673,9 @@ impl<'a> Loader<'a> {
         Ok(())
     }
 }
-/// Reject ranges that overlap: an xref offset is an object header, never a byte inside one.
-/// Bytes before the first indexed construct are only the version line and at most one comment.
-fn verify_ranges(
-    data: &[u8],
-    mut ranges: Vec<(usize, usize)>,
-    footer_start: usize,
-) -> Result<()> {
+/// Reject overlapping ranges and unindexed bytes: every gap may hold only whitespace or comments.
+fn verify_ranges(data: &[u8], mut ranges: Vec<(usize, usize)>, footer_start: usize) -> Result<()> {
     ranges.sort_unstable();
-    if let Some((first, _)) = ranges.first() {
-        let mut gap = Lexer::new(data);
-        gap.skip();
-        if gap.at != *first {
-            return Err(bad("Unindexed data before the first PDF object"));
-        }
-    }
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in ranges {
         if start < 9 || end > footer_start || end <= start {
@@ -654,6 +686,23 @@ fn verify_ranges(
             Some(last) if last.1 > start => return Err(bad("PDF object ranges overlap")),
             _ => merged.push((start, end)),
         }
+    }
+    // Section ranges cover each revision's xref table/stream and startxref/%%EOF, so every gap is
+    // lexed from the previous construct to the next: only whitespace and % comments may be skipped.
+    let mut previous = 0;
+    for (start, end) in merged {
+        let mut gap = Lexer {
+            data,
+            at: previous,
+            nodes: 0,
+        };
+        gap.skip();
+        if gap.at != start {
+            return Err(bad(
+                "Unindexed data or overlapping comments in PDF object section",
+            ));
+        }
+        previous = end;
     }
     Ok(())
 }
@@ -681,6 +730,7 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
     // A cross-reference stream may leave /Index holes; a classic-only chain declares every number.
     let mut sparse = false;
     let mut decoded = 0usize;
+    let mut section_nodes = 0usize;
     let mut cursor = Some(startxref);
     while let Some(offset) = cursor {
         if sections.len() >= MAX_SECTIONS {
@@ -691,10 +741,11 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
             return Err(bad("Cyclic PDF xref /Prev chain"));
         }
         let last = sections.is_empty();
-        let mut section = read_section(data, offset, last, footer_start)?;
+        let mut section = read_section(data, offset, last, footer_start, started)?;
         ranges.push((offset, section.end));
         sparse |= section.stream;
         decoded = decoded.saturating_add(section.decoded);
+        section_nodes = section_nodes.saturating_add(section.nodes);
         if let Some(hybrid) = section.xref_stm.take() {
             check_deadline(started)?;
             let table = xref_stream(data, hybrid)?;
@@ -762,9 +813,10 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         resolving: BTreeSet::new(),
         expanding: BTreeSet::new(),
         decoded,
-        nodes: 0,
+        nodes: section_nodes,
         started,
     };
+    loader.charge(0)?;
     let size = loader.length_of(&size_value)?;
     if size == 0 {
         return Err(bad("PDF Size must name at least object zero"));
@@ -773,9 +825,7 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         return Err(limit("PDF Size exceeds 10000 objects"));
     }
     if loader.entries.keys().any(|number| *number >= size) {
-        return Err(bad(
-            "PDF xref declares an object number at or above Size",
-        ));
+        return Err(bad("PDF xref declares an object number at or above Size"));
     }
     // A classic table declares every number below Size; a stream may leave holes until referenced.
     if !sparse && loader.entries.len() != size {
@@ -790,7 +840,11 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
         if !matches!(zero, Some(XrefEntry::Free { .. })) {
             return Err(bad("PDF object zero must be a free entry"));
         }
-    } else if zero != Some(XrefEntry::Free { generation: u16::MAX }) {
+    } else if zero
+        != Some(XrefEntry::Free {
+            generation: u16::MAX,
+        })
+    {
         return Err(bad("PDF object zero must be free with generation 65535"));
     }
     let pending: Vec<(usize, XrefEntry)> = loader
@@ -804,13 +858,33 @@ pub fn parse(data: &[u8]) -> Result<Document<'_>> {
             XrefEntry::Free { .. } => {}
             XrefEntry::Offset { offset, generation } => {
                 if *offset < 9 || *offset >= footer_start {
-                    return Err(bad("Active PDF object offset is outside the object section"));
+                    return Err(bad(
+                        "Active PDF object offset is outside the object section",
+                    ));
                 }
                 loader.object_at((*number as u32, *generation), *offset)?;
             }
             XrefEntry::Compressed { stream, index } => {
                 let _ = index;
                 loader.expand(*stream)?;
+            }
+        }
+    }
+    // Older revisions declare objects that later sections supersede. They are still indexed by
+    // their own section, so read them only to cover their bytes; the gap verifier must not mistake
+    // them for unindexed data.
+    let mut covered: BTreeSet<usize> = loader.ranges.iter().map(|(start, _)| *start).collect();
+    for (_, entry) in &pending {
+        if let XrefEntry::Offset { offset, .. } = entry {
+            covered.insert(*offset);
+        }
+    }
+    for section in &sections {
+        for (number, entry) in &section.entries {
+            if let XrefEntry::Offset { offset, generation } = *entry {
+                if covered.insert(offset) {
+                    loader.record_at((*number as u32, generation), offset)?;
+                }
             }
         }
     }

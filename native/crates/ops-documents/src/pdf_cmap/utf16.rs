@@ -18,9 +18,7 @@ pub(super) fn utf16(bytes: &[u8]) -> Result<String> {
         return Err(limit("PDF ToUnicode destination exceeds 512 bytes"));
     }
     if !bytes.len().is_multiple_of(2) {
-        return Err(bad(
-            "PDF ToUnicode destination has an odd UTF-16BE length",
-        ));
+        return Err(bad("PDF ToUnicode destination has an odd UTF-16BE length"));
     }
     let mut output = String::new();
     let mut at = 0;
@@ -34,7 +32,9 @@ pub(super) fn utf16(bytes: &[u8]) -> Result<String> {
             let low = u16::from_be_bytes([bytes[at], bytes[at + 1]]);
             at += 2;
             if !(0xdc00..=0xdfff).contains(&low) {
-                return Err(bad("PDF ToUnicode destination has an invalid surrogate pair"));
+                return Err(bad(
+                    "PDF ToUnicode destination has an invalid surrogate pair",
+                ));
             }
             char::from_u32(0x10000 + ((u32::from(unit) - 0xd800) << 10) + u32::from(low) - 0xdc00)
         } else {

@@ -228,9 +228,7 @@ fn size_of(data: &[u8], entries: &BTreeMap<usize, XrefEntry>, value: &Value) -> 
                     ));
                 };
                 if active != generation {
-                    return Err(bad(
-                        "PDF reference generation is not the active xref entry",
-                    ));
+                    return Err(bad("PDF reference generation is not the active xref entry"));
                 }
                 let mut direct = |value: &Value| value.integer();
                 let raw = read_object(data, offset, Some((number, generation)), &mut direct)?;
