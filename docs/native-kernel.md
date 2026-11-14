@@ -314,8 +314,8 @@ operations; TJ spacing numbers are not characters. Text joins runs with newlines
 display. Scope is page-text-layer-content-order, **not rendered reading order**.
 Excluded content is stated in every result: layout, images/OCR, annotations/form fields,
 attachments/metadata, and structure-tree alternate text. A page invoking unsupported
-forms/images, marked content or external graphics state is a gap, even when it also has
-supported text. Blank absent/null/empty/comment-only content yields an empty page;
+images, marked content or external graphics state is a gap, even when it also has supported
+text; Form XObjects are traversed with their own resources. Blank absent/null/empty/comment-only content yields an empty page;
 nonempty graphics without a supported text layer is explicitly unsupported.
 
 The supported text subset is PDF 1.3–1.7 with the foundation's container, standard
