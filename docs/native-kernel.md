@@ -106,8 +106,30 @@ accepts no other arguments. It removes only validated snapshot/stage names for t
 the lock inode, directories and unknown/audit names. It returns `removed`, `retained`, `complete`
 and `effectState`; partial cleanup failures identify prior effects. Readonly purge is refused.
 The host must first invalidate references logically and await active calls; a denied or interrupted
-purge is deferred cleanup, never a reason to rerun business operations. Host lifecycle hooks are
-attached by the host integration slice.
+purge is deferred cleanup, never a reason to rerun business operations. A failed purge records the
+root in a private pending ledger under the temporary directory (bounded attempts, last reason, boot
+id) and is retried when workspace-write authority returns, at the next start-up or through
+`dsh-ops result-cache reclaim --apply`; nothing is removed while the host stays read-only. Because
+the purge keeps the root, the scope directory and the lock, a host-side sweep reclaims idle
+structural leftovers at start-up and after the last owner unloads: it validates the name, the owner,
+the private mode, single-link files and the complete content whitelist, skips and reports a root
+with an unknown entry, excludes this process's live roots, honors `resultCache.maxAgeMs` and stops
+at the first failed removal. Aggregate root/byte budgets (`resultCache.maxRoots`,
+`resultCache.maxTotalBytes`) default to 0 and only classify roots as blocked; the sweep never
+removes a root that still holds snapshot data, which only the authorized purge path may reclaim.
+Host lifecycle hooks are attached by the host integration slice.
+
+## Index cache directory (PS3, #601)
+
+The optional trusted request field `cache_dir` names the host-created directory where the worker may
+persist the platform-agnostic name-index snapshot. It is neither a tool argument nor the
+result-storage root above. Absent means the index is disabled and every caller keeps the existing
+walk. When present it must be an absolute path of 1..4096 bytes that the host created private to the
+user (0700 on POSIX, for example `<DSH_HOME>/dsh-ops/index-cache`); the worker never creates or
+widens it. A cache failure is never a request error: an unwritable, full or corrupt directory falls
+back to the walk, so output stays byte-identical to today's behaviour. Uninstall removes the
+snapshot store (`index.snapshot`, temporary files and the lock file) and leaves the host's
+`dsh-ops` directory in place.
 
 ## Automatic bounded output spill (6b/16)
 
@@ -252,22 +274,28 @@ reference pages retains the declared main-body scope independently of stored-row
 ## PDF parser foundation (15c/16)
 
 The internal PDF container parser accepts a restricted PDF 1.0-1.7 subset: one classic
-xref table, an exact final startxref/EOF footer, unique dictionary keys and object
-identities, and directly declared stream lengths. Every active xref offset must point
-exactly at its object header. Objects cannot overlap; gaps must contain only whitespace
-or comments. This deliberately rejects incremental updates, encryption, object/xref
-streams, recovery scans and ambiguous duplicate data. `/Encrypt`, `/ObjStm` and `/XRef`
-are refused wherever they appear, decoded escapes included, while `/Prev` and `/XRefStm` are
-refused only as trailer keys — the one place they denote an earlier xref section — so a
-dictionary that merely names them, such as an outline item's previous sibling, stays readable.
+xref table or one cross-reference stream, an exact final startxref/EOF footer, unique
+dictionary keys and object identities, and stream lengths that may be direct or indirect.
+Every active xref offset must point at its object header, allowing at most 32 leading
+whitespace bytes for producers that record the line feed. Objects cannot overlap; every gap
+between constructs, and the gap before the xref section, is lexed so it may contain only
+whitespace or comments. Object streams are expanded with cycle and depth limits. This
+deliberately rejects incremental updates and encryption. `/Encrypt` is refused wherever it
+appears, decoded escapes included; `/ObjStm` and `/XRef` name structure this slice reads;
+`/Prev` and `/XRefStm` are refused only as trailer keys — the one place they denote an earlier
+xref section — so a dictionary that merely names them, such as an outline item's previous
+sibling, stays readable.
 
 Bounds are checked before indexed allocation: 16 MiB per input, 10,000 xref entries,
-100,000 metadata values, depth 64, 4,096 keys per dictionary, 256 bytes per name/token,
-and 1 MiB per string or encoded/decoded stream. Reference chains have cycle detection
-and a depth bound. Streams support no filter or one FlateDecode only; external streams,
+100,000 metadata values across the xref section and objects, depth 64, 4,096 keys per
+dictionary, 256 bytes per name/token, 1 MiB per string or encoded/decoded stream, 8 MiB of
+decoded xref/object streams, 4,096 objects per object stream and object-stream expansion
+depth 8. Reference chains have cycle detection and a depth bound. Streams support no filter or one
+FlateDecode only; external streams,
 filter chains and DecodeParms are declined. Actual decompression stops at the decoded
 limit plus one byte and requires a valid checksum, zlib terminator and exact consumption
-of the input. No size advertised by a PDF author bypasses these limits.
+of the input. The container scan has its own 20-second sub-deadline inside the 30-second
+read deadline. No size advertised by a PDF author bypasses these limits.
 
 This slice exposes no tool and makes no text-coverage claim. Page-tree interpretation,
 the supported font/encoding subset, partial results and worker authority checks are

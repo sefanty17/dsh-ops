@@ -48,7 +48,11 @@ fn a_stream_that_names_its_own_compressed_object_is_refused() {
     let bytes = finish(pdf, 7, 6, &[(5, 4, 0)]);
     let error = parse(&bytes).expect_err("a stream that names its own compressed object must fail");
     assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
-    assert!(error.message.contains("Cyclic PDF object stream"), "{}", error.message);
+    assert!(
+        error.message.contains("Cyclic PDF object stream"),
+        "{}",
+        error.message
+    );
 }
 
 #[test]
@@ -78,7 +82,11 @@ fn two_streams_that_expand_each_other_are_refused() {
     let bytes = finish(pdf, 9, 6, &[(7, 5, 0), (8, 4, 0)]);
     let error = parse(&bytes).expect_err("two streams that expand each other must fail");
     assert_eq!(error.code, "DOCUMENT_PARSE_ERROR", "{}", error.message);
-    assert!(error.message.contains("Cyclic PDF object stream"), "{}", error.message);
+    assert!(
+        error.message.contains("Cyclic PDF object stream"),
+        "{}",
+        error.message
+    );
 }
 
 #[test]
@@ -97,12 +105,19 @@ fn a_chain_past_the_expansion_depth_bound_is_refused() {
         let (decoded, first) = object_stream(&[(held as u32, b"1")]);
         pdf.numbered(
             container,
-            &stream(&format!("/Type /ObjStm /N {count} /First {first}"), &decoded),
+            &stream(
+                &format!("/Type /ObjStm /N {count} /First {first}"),
+                &decoded,
+            ),
         );
         compressed.push((held, container as u32, 0u16));
     }
     let bytes = finish(pdf, 23, 13, &compressed);
     let error = parse(&bytes).expect_err("a chain past the expansion depth bound must fail");
     assert_eq!(error.code, "OUTPUT_LIMIT", "{}", error.message);
-    assert!(error.message.contains("object stream expansion"), "{}", error.message);
+    assert!(
+        error.message.contains("object stream expansion"),
+        "{}",
+        error.message
+    );
 }

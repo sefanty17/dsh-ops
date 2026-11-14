@@ -161,7 +161,9 @@ impl Streams {
             self.cache.insert(id, bytes);
         }
         let bytes = &self.cache[&id];
-        if self.processed + bytes.len() > MAX_CONTENT_DECODED || output.len() + bytes.len() > MAX_STREAM {
+        if self.processed + bytes.len() > MAX_CONTENT_DECODED
+            || output.len() + bytes.len() > MAX_STREAM
+        {
             return Err(limit(
                 "PDF processed content exceeds 16 MiB total or 1 MiB per page",
             ));
@@ -178,7 +180,9 @@ impl Streams {
         page: &Page<'_>,
         started: Instant,
     ) -> Result<Vec<u8>> {
-        let contents = get(page.dict, b"Contents")?;
+        let Some(contents) = page.dict.get(b"Contents".as_slice()) else {
+            return Ok(Vec::new());
+        };
         let mut output = Vec::new();
         match contents {
             Value::Array(items) => {
@@ -189,6 +193,7 @@ impl Streams {
                     self.append(doc, reference(item)?, started, &mut output)?;
                 }
             }
+            Value::Null => {}
             value => self.append(doc, reference(value)?, started, &mut output)?,
         }
         Ok(output)
@@ -267,5 +272,55 @@ mod tests {
         rejected("4 0 R", &["4 0 R"], "Cyclic PDF reference");
         rejected("4 0 R", &["(one)"], "must be a bounded nonnegative integer");
         rejected("4 0 R", &["-1"], "must be a bounded nonnegative integer");
+    }
+    fn content_of(page: &str, extra: &[&str]) -> Result<Vec<u8>> {
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            page.to_string(),
+        ];
+        objects.extend(extra.iter().map(|value| value.to_string()));
+        let bytes = emit(objects);
+        let document = parse(&bytes).unwrap();
+        let pages = pages(&document, Instant::now()).unwrap();
+        Streams::new().content(&document, &pages[0], Instant::now())
+    }
+    #[test]
+    fn page_contents_handle_missing_null_empty_and_invalid_members() {
+        assert!(
+            content_of("<< /Type /Page /Parent 2 0 R >>", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            content_of("<< /Type /Page /Parent 2 0 R /Contents null >>", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            content_of("<< /Type /Page /Parent 2 0 R /Contents [] >>", &[])
+                .unwrap()
+                .is_empty()
+        );
+        let error = content_of("<< /Type /Page /Parent 2 0 R /Contents [(x)] >>", &[]).unwrap_err();
+        assert_eq!(error.code, "DOCUMENT_PARSE_ERROR");
+    }
+    #[test]
+    fn page_contents_concatenate_single_and_multiple_streams_in_order() {
+        let single = content_of(
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+            &["<< /Length 2 >>\nstream\nab\nendstream"],
+        )
+        .unwrap();
+        assert_eq!(single, b"ab".to_vec());
+        let multiple = content_of(
+            "<< /Type /Page /Parent 2 0 R /Contents [4 0 R 5 0 R] >>",
+            &[
+                "<< /Length 2 >>\nstream\nab\nendstream",
+                "<< /Length 2 >>\nstream\ncd\nendstream",
+            ],
+        )
+        .unwrap();
+        assert_eq!(multiple, b"abcd".to_vec());
     }
 }

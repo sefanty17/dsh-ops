@@ -212,7 +212,8 @@ impl<'a> Lexer<'a> {
         Err(bad("Unclosed PDF literal string"))
     }
     /// A name is a token, not a policy decision: /Prev and /XRefStm describe an update only as
-    /// trailer keys, and /Encrypt is refused since encryption makes every string unreadable.
+    /// trailer keys, and /Encrypt is refused because encryption makes every string unreadable. The
+    /// xref/object-stream reader below interprets /ObjStm and /XRef as structure, not policy.
     fn name(&mut self) -> Result<Vec<u8>> {
         self.at += 1;
         let mut name = Vec::new();
