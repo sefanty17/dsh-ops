@@ -1,3 +1,7 @@
+//! The next slice wires this module into font decoding; until then nothing
+//! constructs it.
+#![allow(dead_code)]
+
 //! Bounded ToUnicode CMap decoding: character codes to Unicode. Glyph programs are never read.
 mod parse;
 mod ranges;
