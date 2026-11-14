@@ -403,7 +403,9 @@ fn offset_tolerance_is_bounded_and_comments_are_not_headers() {
         );
     }
 
-    let mut two = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj (100%) 2 0 obj\n<<>>\nendobj\n".to_vec();
+    // The percent stays inside the first object's literal string; a stray string in the gap is
+    // unindexed data and must not be recovered.
+    let mut two = b"%PDF-1.4\n1 0 obj\n<< /Note (100%) >> endobj 2 0 obj\n<<>>\nendobj\n".to_vec();
     let second = two
         .windows(7)
         .position(|window| window == b"2 0 obj")
